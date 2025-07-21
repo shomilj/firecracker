@@ -51,6 +51,8 @@ mod normalize;
 
 pub use normalize::{FeatureInformationError, GetMaxCpusPerPackageError, NormalizeCpuidError};
 
+use self::normalize::set_bit;
+
 /// Intel brand string.
 pub const VENDOR_ID_INTEL: &[u8; 12] = b"GenuineIntel";
 
@@ -67,6 +69,9 @@ pub const VENDOR_ID_AMD_STR: &str = unsafe { std::str::from_utf8_unchecked(VENDO
 
 /// To store the brand string we have 3 leaves, each with 4 registers, each with 4 bytes.
 pub const BRAND_STRING_LENGTH: usize = 3 * 4 * 4;
+
+/// Async page fault bit
+const KVM_FEATURE_ASYNC_PF_INT_BIT: u8 = 14;
 
 /// Mimic of [`std::arch::x86_64::__cpuid`] that wraps [`cpuid_count`].
 fn cpuid(leaf: u32) -> std::arch::x86_64::CpuidResult {
@@ -242,6 +247,17 @@ pub trait CpuidTrait {
 
         Ok(())
     }
+
+    /// Disables async page fault handling in CPUID.
+    fn disable_kvm_feature_async_pf(&mut self) -> Result<(), MissingHypervisorLeaf> {
+        let leaf: &mut CpuidEntry = self
+            .get_mut(&CpuidKey::leaf(0x40000001))
+            .ok_or(MissingHypervisorLeaf)?;
+
+        set_bit(&mut leaf.result.eax, KVM_FEATURE_ASYNC_PF_INT_BIT, false);
+
+        Ok(())
+    }
 }
 
 impl CpuidTrait for kvm_bindings::CpuId {
@@ -290,6 +306,11 @@ impl CpuidTrait for kvm_bindings::CpuId {
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 #[error("Missing brand string leaves 0x80000002, 0x80000003 and 0x80000004.")]
 pub struct MissingBrandStringLeaves;
+
+/// Error type for hypervisor-related CPUID customizations.
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+#[error("Missing hypervisor leaf 0x40000001.")]
+pub struct MissingHypervisorLeaf;
 
 /// Error type for conversion from `kvm_bindings::CpuId` to `Cpuid`.
 #[rustfmt::skip]
