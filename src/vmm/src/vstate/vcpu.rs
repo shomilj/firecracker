@@ -204,7 +204,7 @@ impl Vcpu {
     pub fn new(index: u8, vm: &Vm, exit_evt: EventFd) -> Result<Self, VcpuError> {
         let (event_sender, event_receiver) = channel();
         let (response_sender, response_receiver) = channel();
-        let kvm_vcpu = KvmVcpu::new(index, vm).unwrap();
+        let kvm_vcpu = KvmVcpu::new(index, vm).map_err(VcpuError::VcpuResponse)?;
 
         Ok(Vcpu {
             exit_evt,
