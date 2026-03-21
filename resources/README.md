@@ -6,126 +6,254 @@
 
    1.2. The design optimizes for **repeatable CI**: the same inputs (base distribution, configuration fragments, overlay content, compiler flags) should yield inspectable outputs (package manifests, kernel configuration snapshots, binary images) so failures can be bisected to either the hypervisor, the guest image, or the policy layer.
 
-   1.3. Two parallel concerns run through the bundle: **guest-side behavior** (what runs inside the microVM to make tests possible—network bring-up, timing signals to the host, memory stress tools) and **host-side behavior** (how the VMM’s threads are allowed to call into the kernel). Documentation below treats both, because they are often exercised together in integration tests.
+   1.3. Two parallel concerns run through the bundle: **guest-side behavior** (what runs inside the microVM to make tests possible—network bring-up, timing signals to the host, memory stress tools) and **host-side behavior** (how the VMM’s threads are allowed to call into the kernel). Both are often exercised together in integration tests.
 
-2. **End-to-end build architecture**
+   1.4. **Downstream consumption**: host orchestration downloads version-scoped guest binaries from object storage into a build-scoped image cache, then post-processes them for SSH keys and writable disks. Those steps assume the artifacts described here remain semantically stable across minor versions unless intentionally version-bumped.
 
-   2.1. A single orchestrating script drives the pipeline. It installs host build dependencies (compiler toolchain, container runtime, squashfs tooling, initramfs helpers), selects the host CPU architecture, and writes all deliverables into an **architecture-named output directory** beside the resources tree so x86-64 and AArch64 builds never overwrite each other.
+2. **Guest root filesystem pipeline (deep view)**
 
-   2.2. **Root filesystem construction** uses a privileged container that bind-mounts a working directory. A seed tree is copied in first: it carries pre-authored unit files, small compiled helpers, and shell logic. Inside the container, a second script merges that seed into a minimal Ubuntu base, runs the package manager non-interactively, applies sysctl and systemd customizations, records an installed-package manifest on the root user’s home area, then **exports selected top-level directories** (userland binaries, libraries, configuration, home and root content) into a temporary root tree. Mountpoint directories are created empty so the final image is bootable when combined with kernel-provided virtual devices.
+   The rootfs path is a **multi-stage factory**: native helper compilation, overlay fusion, privileged base-distribution customization, filesystem export, compression, manifest capture, and cleanup. Kernels and initramfs follow related but separate tracks.
 
-   2.3. **Command-line tooling for object storage** is installed into the guest tree from upstream bundles (not from distribution packages), placing binaries under a local prefix so tests can upload logs or artifacts when cloud credentials are available.
+   2.1. **Host preparation before any guest work**
 
-   2.4. The populated tree is compressed with **Zstandard-backed squashfs**, preserving root ownership semantics suitable for loop-mounting or direct kernel attachment as a read-only block device. The manifest is moved alongside the squashfs image for auditing “what was inside” a given CI run.
+      2.1.1. The rebuild driver ensures Debian packages exist for compilers, flex and bison, libssl, squashfs, static busybox, cpio, curl, patch, and a container runtime. This is intentionally broad because later stages compile kernels, run nested containers, and assemble initramfs cpio archives.
 
-   2.5. **Small native utilities** are compiled on the host immediately before rootfs assembly, then removed from the seed tree after packaging so the source of truth remains the checked-in C sources while the build stays reproducible. One utility is only built on AArch64 where a specific instruction-level test needs it.
+      2.1.2. An **architecture-named output directory** is created as a dedicated sibling of the working tree so x86-64 and AArch64 artifact trees never collide on multi-arch builders.
 
-   2.6. **Initramfs** is a separate, much smaller artifact: a static shell binary provides `init`, a minimal `dev`/`proc`/`sys` layout is created, and a hand-written `init` script mounts pseudo-filesystems, writes a magic value to a **fixed guest-physical MMIO address** (architecture-dependent), then drops to an interactive shell on the console. That write implements a **boot-time handshake** with the VMM: the monitor exposes a synthetic device at a known address; early userspace maps physical memory and stores a byte there so the host can measure how long boot took. The same address constants appear in the main guest init wrapper and in the VMM’s architecture layout.
+   2.2. **Native helper compilation stage**
 
-   2.7. **Kernel builds** clone a long-lived Linux fork maintained by the cloud vendor, discover the **newest tag** matching either a microvm-specific naming pattern or a generic kernel pattern for the requested baseline version, check out that tag, and concatenate **multiple configuration fragments** into one `.config`. Older values are overridden by newer fragments. The build target differs by architecture (ELF vmlinux on x86-64, PE Image on AArch64). Output is normalized to a version string derived from the kernel’s own release file, with optional **flavour suffixes** for variants such as “no ACPI” on x86-64.
+      2.2.1. Small C sources living under the overlay tree are compiled with the host GCC into fixed destination names (boot notification, memory filling, userfaultfd timing, optional AArch64 physical-memory probe). This happens **before** the main rootfs assembly so the overlay carries fresh binaries.
 
-   2.8. **Debug kernels** repeat selected builds with extra fragments enabling tracing subsystems and DWARF debug info, writing into a nested `debug` output directory. A post-step may **split debug symbols** from the main binary, strip the executable, attach a GNU debug link, and gzip the detached symbol file for storage efficiency while keeping GDB usable.
+      2.2.2. One helper is gated on AArch64 only because a specific instruction-level test needs it; other helpers build on every architecture.
 
-```
-  ┌─────────────────────────────────────────────────────────────────┐
-  │  Host build environment (toolchain, Docker, squashfs, cpio)    │
-  └───────────────┬───────────────────────────────┬───────────────┘
-                  │                               │
-                  v                               v
-┌─────────────────────────┐         ┌────────────────────────────┐
-│  Seed overlay +         │         │  Vendor Linux fork +       │
-│  chroot customization   │         │  layered Kconfig fragments │
-│  -> squashfs + manifest │         │  -> vmlinux / Image        │
-└─────────────────────────┘         └────────────────────────────┘
-                  │                               │
-                  └───────────┬───────────────────┘
-                              v
-                  ┌───────────────────────┐
-                  │  CI artifacts per     │
-                  │  architecture folder  │
-                  └───────────────────────┘
-```
+   2.3. **Overlay seeding**
 
-3. **Guest root filesystem: policy and personality**
+      2.3.1. The overlay subtree is copied wholesale into a working directory. It carries pre-authored systemd units, network bootstrap scripts, mount units for tmpfs-backed runtime state, and the freshly compiled helpers.
 
-   3.1. The guest is intentionally **minimal but serviceable**: core userspace, init system, SSH server, networking utilities, lightweight scripting, performance tools, tracing, and hardware introspection where the architecture allows. Architecture-specific packages are added only on x86-64 (model-specific register and CPUID tooling).
+   2.4. **Privileged base-image stage (nested container)**
 
-   3.2. **Authentication** is relaxed for automation: the superuser password is cleared so non-interactive workflows can log in where needed, and the serial console is configured for **automatic login** to the superuser on the serial line that Firecracker typically wires to the microVM console—avoiding a login prompt that would block tests waiting for a shell.
+      2.4.1. A **container daemon** is started in-process for the rebuild environment when object-store–minimal base tarballs are not used directly; the script waits until the daemon socket responds.
 
-   3.3. **Network time and resolver daemons** are disabled by unlinking their unit symlinks, reflecting an environment where **no real upstream DNS or NTP** is assumed; tests supply their own notion of time and naming.
+      2.4.2. A **minimal Ubuntu cloud image** base is pulled from a public registry as the inner root. The working tree is bind-mounted read-write with a working directory set to the resource tree.
 
-   3.4. **Temporary storage** uses an in-memory filesystem backed by the kernel tmpfs driver, reducing wear on any backing disk and matching ephemeral workloads.
+      2.4.3. Inside that container, a **chroot customization script** runs as the main non-interactive entry. It installs a curated package set (udev, systemd, OpenSSH server, iproute2, curl, socat, Python minimal, iperf3, ping, fio, kmod, tmux, hwloc, editor, trace-cmd, linuxptp, strace, boto3, plus x86-only MSR and CPUID tools), sets hostname, clears the root password, configures serial getty for **root autologin** on the console Firecracker attaches, enables the custom networking unit, disables resolver and time-sync daemons, enables tmpfs-backed temporary directories and the systemd state tmpfs mount, strips documentation and locale trees, and appends a sysctl line to disable unprivileged BPF. It emits a **dpkg manifest** into root’s home for traceability.
 
-   3.5. **Documentation and locale trees** are deleted from the image after package installation to shrink size and attack surface.
+      2.4.4. After the inner script, selected top-level directories are **tar-streamed** from the ephemeral container root into the working rootfs directory: userland binaries, libraries, configuration, home and root content. Empty mountpoint directories are created for dev, proc, sys, run, tmp, and package database state so the tree is bootable when combined with kernel devices.
 
-   3.6. A sysctl knob **disables unprivileged BPF program attachment**, closing a known speculative-execution-related class of issues at the cost of forbidding unprivileged eBPF in the guest—which aligns with the threat model of short-lived, test-controlled workloads.
+      2.4.5. **Cloud command-line tooling** is installed from an upstream bundle into a local prefix inside the tree so tests can upload logs when credentials exist in the environment.
 
-4. **Overlay: systemd integration and virtual networking bootstrap**
+      2.4.6. **Resolver configuration** is replaced with a minimal stub because tests do not assume working upstream DNS.
 
-   4.1. A **oneshot service** runs early in boot and executes a shell script that enumerates every non-loopback network interface, discovers its Ethernet address, and derives an **IPv4 address** from the last four octets of a vendor-specific prefix baked into the address. The script assigns a `/30` address to each interface and brings the link up. The design is deterministic: given MAC allocation rules in tests, the guest always lands on predictable addresses without DHCP.
+      2.4.7. The manifest is moved out to the output directory with a basename matching the rootfs flavor; the populated tree is compressed with **Zstandard-backed squashfs** preserving root ownership semantics.
 
-   4.2. The service is ordered so **secure shell** starts after addresses exist, so tests can immediately connect over the network namespace or tap setup the harness provides.
+      2.4.8. **Cleanup** removes compiled helper binaries from the overlay source so the next run recompiles from pristine sources; ephemeral daemon logs are removed.
 
-   4.3. A **mount unit** replaces the persistent directory used for runtime state under the init system’s state path with a **tmpfs** of bounded size and inode count, mode `1777`, with `nosuid` and `nodev`. That keeps the read-only root clean, avoids persistent fingerprinting across boots, and prevents setuid execution from that location.
+   2.5. **Initramfs track (parallel small artifact)**
 
-5. **Guest userspace helpers (behavioral contract)**
+      2.5.1. A minimal directory layout is created with busybox providing `sh` and `mount`.
 
-   5.1. **Boot-completion notification.** The first userspace stage after the kernel hands off to PID 1 can be a tiny wrapper that memory-maps a single page at the **guest-physical MMIO address** reserved for the boot-timer device, writes a fixed byte value, asynchronously syncs the mapping, and immediately execs the real init. That signals the VMM that the guest reached userspace; the host can stop timers and assert latency budgets. The MMIO base differs between x86-64 and AArch64 to match each architecture’s memory map.
+      2.5.2. An `init` shell script mounts devtmpfs, proc, and sysfs, writes a magic byte to a **fixed guest-physical MMIO address** (one constant on x86-64, another on AArch64), rewires console file descriptors, prints uptime, and drops to an interactive shell. The MMIO write implements the **boot handshake** with the VMM’s synthetic boot-timer device.
 
-   5.2. **Memory pressure and OOM.** One helper forks a child that allocates anonymous memory in **one-megabyte chunks** until the parent’s child exits—either successfully or via OOM killer. The parent writes a short message to a temporary file describing whether the child was killed by signal or completed normally. Granular allocation avoids a single huge mapping that might fail early under pressure.
+      2.5.3. The tree is packed into a **newc cpio** archive written beside the squashfs outputs.
 
-   5.3. **Balloon and confidentiality checks.** Another helper allocates a large anonymous region and scans it as an array of 32-bit integers, looking for **four consecutive occurrences** of a given value. Integration tests pair this with the memory filler: after a balloon deflates and returns memory to the host, the test searches for leftover data patterns to validate that **scrubbing or reuse** semantics match expectations.
+   2.6. **Kernel track**
 
-   5.4. **Userfaultfd and snapshot restore.** A dedicated helper maps a large anonymous region (on the order of hundreds of megabytes), touches every page once, then blocks waiting for a user-defined signal. After a snapshot is taken and restored, the test sends that signal; the helper then rewrites every page and measures elapsed time using a monotonic boot clock, writing the duration in nanoseconds to a temporary file. The pattern forces **fast page faults** across the whole region after restore—exercising lazy memory and migration paths.
+      2.6.1. A long-lived vendor Linux fork is cloned shallowly if missing.
 
-   5.5. **AArch64 instruction-level probe.** On that architecture only, a helper opens the physical memory device, maps a small window around the legacy BIOS area, and executes a **load instruction with post-increment** that reads past the mapping’s end. The intent is to surface **kernel-level** handling (e.g. `ENOSYS` or fault behavior) when user code performs a specific addressing pattern—useful for validating paravirtual or emulation quirks.
+      2.6.2. **Tag selection** prefers microvm-specific kernel tags for the requested baseline minor version; if none match, it falls back to generic kernel tags for that minor line. The newest matching tag wins.
 
-6. **Kernel configuration strategy**
+      2.6.3. **Configuration concatenation** merges multiple fragments in order; later fragments override earlier keys. A cross-cutting CI fragment enables squashfs with Zstd, partition table support, direct physical memory access where tests probe hardware, and input paths for legacy reboot signaling; architecture-specific errata toggles appear in AArch64-focused fragments.
 
-   6.1. Baseline configurations are **imported wholesale** from Amazon Linux kernel builds for specific microvm-oriented versions. They encode a full Linux feature set appropriate for the vendor’s distribution, not a hand-minimized microkernel.
+      2.6.4. **Build targets** differ: ELF `vmlinux` on x86-64, PE `Image` on AArch64. Outputs are renamed to include a normalized version string plus optional **flavour suffixes** (for example variants without ACPI on x86-64).
 
-   6.2. A **CI overlay fragment** applies cross-cutting choices: exposing the running configuration via `/proc`, enabling **MS-DOS partition tables** and **Zstandard SquashFS** support, turning on **direct physical memory access** (`/dev/mem`) for tests that need MMIO-style probes, and enabling keyboard and PS/2-style input paths so **Ctrl+Alt+Del** handling exists where the architecture uses those drivers. Some errata toggles are explicitly disabled for AArch64 compatibility with the test matrix.
+      2.6.5. **Debug builds** add ftrace and DWARF fragments, output into a nested debug directory, then may split debug information, strip the executable, add a GNU debug link, and gzip the detached symbols for storage efficiency.
 
-   6.3. **Debug variants** add ftrace tracers (function, graph, preempt, IRQ-off, scheduler, block I/O tracepoints, syscall tracing), function profiler support, and DWARF debug info with frame pointers—trading binary size and build time for observability.
+   2.7. **Orchestration modes**
 
-   6.4. **Design tradeoffs** documented in the disclaimer: the kernel is tuned for **high density** (many small guests on one host). That implies aggressive virtual address space limits on AArch64, which can break software that assumes a larger user virtual address space (for example tooling that expects 48-bit virtual addresses). The tradeoff is intentional for ephemeral workloads and must be understood when porting guest workloads.
+      2.7.1. A default mode builds rootfs plus the standard kernel matrix.
 
-7. **Seccomp policy architecture**
+      2.7.2. A rootfs-only mode skips kernel cloning.
 
-   7.1. The monitor runs multiple classes of threads with different responsibilities. The policy bundle expresses **three separate profiles**—one for the main VMM thread group, one for the **API server** thread, and one for **vCPU worker** threads. Each profile is a **default-deny** list: any syscall not explicitly allowed causes the syscall to **trap** (fail) rather than silently allowing unknown behavior.
+      2.7.3. A kernel-only mode accepts optional version selectors to reduce iteration time when tuning Kconfig fragments.
 
-   7.2. Within each profile, a **positive filter** enumerates **allowed syscalls**. Many entries are unconditional; others attach **argument constraints** so that only specific `ioctl` command numbers, `fcntl` operations, or socket flags are permitted. This pattern is essential for `ioctl`, which multiplexes many unrelated operations through one syscall number.
-
-   7.3. **vCPU profile** focuses on KVM and CPU affinity: `ioctl` allowances map to KVM run, register access, IRQ routing, TSC clock, KVM clock control after vCPU pause, and related controls. The intent is to let the KVM loop run while blocking unrelated device `ioctl`s.
-
-   7.4. **API profile** covers networking and HTTP-style serving: socket creation, accept with `CLOEXEC`, TLS-related reads/writes, epoll, timerfd, and signal handling needed for graceful shutdowns.
-
-   7.5. **Main VMM profile** is the broadest: memory mapping, file I/O, eventfd, io_uring (for storage path experiments), virtio-net tap I/O vectors, vsock, timers, futex, and signal masks for Rust runtime panics. Comments in the policy (not reproduced here) tie many syscalls to concrete subsystems—snapshot persistence, drive hotplug, RNG, metrics.
-
-   7.6. A **stub profile** exists for platforms or build modes where the policy is not yet specialized: it **allows everything** but is structured so tooling can still attach filters—useful during bring-up or when syscall usage is still being enumerated.
-
-   7.7. Operationally, **deny-by-default** reduces attack surface and makes accidental reliance on new libc or Rust runtime syscalls visible during development (the process crashes or logs a seccomp failure rather than silently expanding capability).
+3. **Guest root filesystem pipeline diagram**
 
 ```
-  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-  │  VMM threads │     │  API thread  │     │ vCPU threads │
-  │  (devices,   │     │  (HTTP API,  │     │  (KVM run    │
-  │   io_uring,  │     │   sockets)   │     │   loop)      │
-  │   snapshot)  │     │              │     │              │
-  └──────┬───────┘     └──────┬───────┘     └──────┬───────┘
-         │                    │                    │
-         v                    v                    v
-   seccomp profile A      profile B            profile C
-   (broad allow-list    (network + TLS +     (KVM ioctl
-    with ioctl filter)  epoll + timers)      allow-list)
+  +------------------+
+  | install host     |
+  | deps + mkdir out |
+  +--------+---------+
+           |
+           v
+  +------------------+      +---------------------+
+  | compile overlay  |      | start nested docker |
+  | C helpers        |      | (if using base img) |
+  +--------+---------+      +----------+----------+
+           |                             |
+           v                             v
+  +------------------+
+  | copy overlay     |
+  | into workdir     |
+  +--------+---------+
+           |
+           v
+  +------------------+
+  | privileged inner|
+  | image: chroot   |
+  | script installs |
+  | packages + cfg  |
+  +--------+---------+
+           |
+           v
+  +------------------+
+  | tar export dirs  |
+  | + AWS CLI bundle |
+  | + mountpoints    |
+  +--------+---------+
+           |
+           v
+  +------------------+      +------------------+
+  | mksquashfs zstd  |      | build initramfs  |
+  | + move manifest  |      | cpio + MMIO init |
+  +------------------+      +------------------+
+           |
+           v
+  +------------------+
+  | clone + tag      |
+  | vendor kernel    |
+  | cat Kconfigs     |
+  | make + rename    |
+  +------------------+
 ```
 
-8. **Cross-cutting concerns**
+4. **Guest root filesystem: policy and personality**
 
-   8.1. **Reproducibility:** manifests and saved kernel `.config` files make the artifact self-describing.
+   4.1. The guest is intentionally **minimal but serviceable**: core userspace, init system, SSH server, networking utilities, lightweight scripting, performance tools, tracing, and hardware introspection where the architecture allows. Architecture-specific packages are added only on x86-64 (model-specific register and CPUID tooling).
 
-   8.2. **Separation of concerns:** guest images encode “what runs inside” tests; seccomp JSON encodes “what the host OS may do on behalf of the VMM.”
+   4.2. **Authentication** is relaxed for automation: the superuser password is cleared where appropriate, and serial console autologin avoids blocking tests that wait for a shell.
 
-   8.3. **Testability:** MMIO boot signals, deterministic networking, memory stress tools, and balloon verification helpers are all **cooperative**—they assume a harness that can drive signals, snapshots, and device configurations in lockstep.
+   4.3. **Network time and resolver daemons** are disabled by unlinking unit symlinks, reflecting an environment where **no real upstream DNS or NTP** is assumed; tests supply their own notion of time and naming.
 
-   8.4. **Security posture:** reduced services in the guest, no unprivileged BPF, syscall filtering on the host, and documented kernel limits for density all reinforce a **minimal privilege** stance appropriate for CI and microVM workloads rather than general-purpose servers.
+   4.4. **Temporary storage** uses tmpfs for `/tmp` and for systemd’s mutable state path, reducing wear on backing disks and matching ephemeral workloads.
+
+   4.5. **Documentation and locale trees** are deleted after package installation to shrink size and attack surface.
+
+   4.6. A sysctl knob **disables unprivileged BPF program attachment**, closing a speculative-execution-related class of issues at the cost of forbidding unprivileged eBPF in the guest.
+
+5. **Overlay: systemd integration and virtual networking bootstrap**
+
+   5.1. A **oneshot service** runs early in boot and executes a shell script that enumerates every non-loopback network interface, discovers its Ethernet address, and derives an **IPv4 address** from the last four octets of a vendor-specific prefix baked into the address. The script assigns a `/30` address to each interface and brings the link up. Given MAC allocation rules in tests, the guest lands on predictable addresses without DHCP.
+
+   5.2. Ordering ensures **secure shell** starts after addresses exist so tests can connect immediately over the tap or namespace the harness provides.
+
+   5.3. A **mount unit** replaces persistent runtime state under the init system with a bounded tmpfs (`nosuid`, `nodev`, sticky world-writable mode) so the read-only root stays clean and setuid execution from that location is avoided.
+
+6. **Guest userspace helpers (behavioral contract)**
+
+   6.1. **Boot-completion notification.** The first userspace stage after the kernel hands off to PID 1 may memory-map a single page at the guest-physical MMIO address reserved for the boot-timer device, write a fixed byte value, asynchronously sync the mapping, and exec the real init—signaling the VMM that the guest reached userspace for latency assertions.
+
+   6.2. **Memory pressure and OOM.** One helper forks a child that allocates anonymous memory in **one-megabyte chunks** until the child exits—successfully or via OOM. The parent records the outcome in a small temporary file.
+
+   6.3. **Balloon and confidentiality checks.** Another helper scans memory for repeated patterns after balloon operations to validate scrubbing semantics.
+
+   6.4. **Userfaultfd and snapshot restore.** A helper maps a large anonymous region, touches every page, blocks on a signal, then after snapshot restore rewrites every page and records elapsed time—exercising fast page faults across the region.
+
+   6.5. **AArch64 instruction-level probe.** On that architecture only, a helper maps a window around legacy BIOS space and executes a load with post-increment past the mapping end to surface kernel handling of edge addressing patterns.
+
+7. **Kernel configuration strategy**
+
+   7.1. Baseline configurations are **imported wholesale** from Amazon Linux kernel builds for microvm-oriented versions—a full distribution feature set, not a hand-minimized microkernel.
+
+   7.2. A **CI overlay fragment** applies cross-cutting choices: exposing configuration via procfs, enabling MS-DOS partition tables and Zstandard squashfs, exposing `/dev/mem` for MMIO-style probes, and keyboard or PS/2 paths for legacy reboot signaling where applicable.
+
+   7.3. **Debug variants** add ftrace tracers, profilers, and DWARF with frame pointers.
+
+   7.4. **Density tradeoff**: the kernel may enforce aggressive virtual address space limits on AArch64 to favor many small guests; software assuming a larger user virtual address space may break—an intentional tradeoff for ephemeral CI workloads.
+
+8. **Seccomp policy architecture (triple-model)**
+
+   Host syscall policy is not a single global allow-list. The monitor maps **three independent profiles** to three thread families, each serialized as its own JSON object inside a target-triple document. A separate **unimplemented** document provides a permissive stub for bring-up when specialization is incomplete.
+
+   8.1. **Why three profiles instead of one**
+
+      8.1.1. Threads that run the KVM vCPU loop perform a tight sequence of KVM ioctl-driven operations and should not need socket or HTTP stack syscalls. Threads that serve the control API must create sockets, accept connections, and drive TLS without ever needing the full KVM ioctl surface. Threads that coordinate devices, snapshots, virtio, and metrics combine file I/O, memory mapping, io_uring, vsock, and signal handling at a much broader level than either of the other two.
+
+      8.1.2. Splitting policies **shrinks each allow-list** to the minimal surface for that role, reducing accidental syscall exposure if a library pulls in a new interface on only one thread type.
+
+   8.2. **Per-profile JSON shape**
+
+      8.2.1. Each profile object carries a **default action** of trap (syscall denied causes a synchronous fault the process can observe) and a **filter action** of allow for matching rules—classic seccomp-bpf “deny by default, allow explicitly.”
+
+      8.2.2. The **filter** array lists syscall names. Many entries are unconditional allows. Others attach **argument comparators** restricting ioctl command numbers, fcntl commands, socket families, or flag combinations—essential because ioctl multiplexes unrelated driver operations behind one syscall number.
+
+      8.2.3. **Comments** inline document engineering rationale (which subsystem triggered the need, which Rust std path exercised the syscall). Comments are not loaded into the kernel; they are for human audit and codegen.
+
+   8.3. **VMM-oriented profile (broadest)**
+
+      8.3.1. Covers memory management (mapping, protection changes, advice), file descriptors and regular file I/O, epoll and eventfd, io_uring submission paths for storage experiments, virtio-net vector I/O, vsock, timers, futex, and signal masks for runtime abort paths.
+
+      8.3.2. ioctl rules are the largest category: block device topology, tap/tun setup, KVM ancillary ioctls not covered in the vCPU profile, and housekeeping ioctls needed for device models and metrics.
+
+   8.4. **API-oriented profile**
+
+      8.4.1. Emphasizes **network-facing** syscalls: socket creation, accept with close-on-exec, TLS read/write paths, epoll, timerfd, and signal handling for graceful shutdown.
+
+      8.4.2. Deliberately omits KVM vCPU ioctls so a compromised API worker cannot pivot into CPU emulation primitives without already satisfying the broader VMM profile on other threads.
+
+   8.5. **vCPU-oriented profile**
+
+      8.5.1. Focuses on **KVM run loop** requirements: ioctl allowances for run, register access, IRQ routing, clock sources, and controls needed after vCPU pause—mapped narrowly so unrelated device ioctls fail.
+
+      8.5.2. Complements the VMM profile: device setup happens elsewhere; vCPU threads stay in their lane.
+
+   8.6. **Stub profile**
+
+      8.6.1. A JSON document may define an **allow-all** stance while retaining structural compatibility so tooling can attach filters during early porting or when enumerating syscall usage before tightening lists.
+
+   8.7. **Per-target artifacts**
+
+      8.7.1. Separate JSON documents exist for x86-64 and AArch64 musl targets because syscall numbers and needed ioctl subsets differ; build integration selects the matching document when compiling filters into the monitor binary.
+
+   8.8. **Operational consequence**
+
+      8.8.1. When Rust, libc, or third-party code introduces a new syscall on a monitored thread type, the process fails closed—developers see the trap rather than silently gaining capability. That turns policy drift into an explicit edit to the JSON followed by regeneration.
+
+9. **Seccomp triple-model diagram**
+
+```
+     +----------------+     +----------------+     +----------------+
+     | VMM-coordinator|     | API server     |     | vCPU workers   |
+     | threads        |     | threads        |     | (KVM run loop) |
+     +-------+--------+     +-------+--------+     +-------+--------+
+             |                      |                      |
+             v                      v                      v
+      +-------------+        +-------------+        +-------------+
+      | Profile W:  |        | Profile A:  |        | Profile V:  |
+      | wide file + |        | sockets +   |        | narrow KVM  |
+      | mm + io_uring|        | TLS + epoll |        | ioctl allow |
+      +-------------+        +-------------+        +-------------+
+             \                      |                      /
+              \                     |                     /
+               \                    |                    /
+                v                   v                   v
+             +-----------------------------------------------+
+             |  seccomp BPF loaded per thread / clone flags   |
+             |  default: trap on unknown syscall               |
+             +-----------------------------------------------+
+```
+
+10. **Cross-cutting concerns**
+
+    10.1. **Reproducibility:** manifests and saved kernel configuration snapshots make artifacts self-describing.
+
+    10.2. **Separation of concerns:** guest images encode what runs inside tests; seccomp JSON encodes what the host OS may do on behalf of which monitor threads.
+
+    10.3. **Testability:** MMIO boot signals, deterministic networking, memory stress tools, and balloon verification helpers are **cooperative**—they assume a harness that drives signals, snapshots, and device configurations in lockstep.
+
+    10.4. **Security posture:** reduced services in the guest, no unprivileged BPF, syscall filtering by thread role, and documented kernel limits for density reinforce **minimal privilege** appropriate for CI and microVM workloads.
+
+11. **Relationship to CI and automation hooks**
+
+    11.1. Changes under the seccomp JSON subtree are treated as **performance- and security-sensitive** in upstream automation: post-merge hooks may schedule statistical performance comparisons when those files change alongside Rust sources, because syscall policy affects hot paths and binary layout.
+
+    11.2. Guest artifacts rebuilt from this bundle are published alongside minor Firecracker versions; the host-side orchestration downloads that scope so tests always evaluate a coherent kernel, rootfs, and hypervisor triple.
