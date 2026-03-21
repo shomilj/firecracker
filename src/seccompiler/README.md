@@ -68,7 +68,7 @@
 
    - **Full mode without argument checks:** If no conditions are listed, the simple rule API adds a syscall-wide rule with no argument filters—matching any call to that syscall.
 
-   7.4. **Export BPF to an anonymous memory-backed file.** A memory-backed file descriptor is created with a fixed conventional name string suitable for memfd-style APIs. The filter context is exported as raw BPF bytecode into that descriptor. The handle is wrapped as a standard file object for convenience.
+   7.4. **Export BPF to an anonymous memory-backed file.** A memory-backed file descriptor is created with a fixed conventional name string suitable for the usual Linux anonymous-memory-file pattern. The filter context is exported as raw BPF bytecode into that descriptor. The handle is wrapped as a standard file object for convenience.
 
    7.5. **Measure, allocate, read.** After export, the implementation rewinds the descriptor, queries its size, and treats the bytecode as a sequence of 64-bit words. A buffer of the right length is filled by a single exact read, then the descriptor is rewound again so the same scratch space can be reused for the next named filter. This avoids persisting intermediate BPF on disk and keeps each filter’s bytecode isolated in memory before aggregation.
 
