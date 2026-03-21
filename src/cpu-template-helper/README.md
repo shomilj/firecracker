@@ -10,7 +10,7 @@
 
 2. **Relationship to the VMM and the “microVM build”**
 
-   2.1. Nearly every substantive operation begins by constructing a `Vmm` instance and associated resource bundle from a Firecracker-style JSON configuration, optionally augmented with a deserialized custom CPU template. The construction path is the same *boot-oriented* builder used elsewhere: an event loop handle is created, seccomp filters are explicitly set to an empty set (the tool is not a long-running sandboxed service), and the microVM is prepared *without* requiring a full guest workload—only enough structure exists for CPU state to be introspected.
+   2.1. Nearly every substantive operation begins by constructing a virtual machine monitor instance and associated machine resource bundle from a Firecracker-style JSON configuration, optionally augmented with a deserialized custom CPU template. The construction path is the same *boot-oriented* builder used elsewhere: an event loop handle is created, seccomp filters are explicitly set to an empty set (the tool is not a long-running sandboxed service), and the microVM is prepared *without* requiring a full guest workload—only enough structure exists for CPU state to be introspected.
 
    2.2. When the operator does not supply a configuration path, the tool synthesizes a minimal valid configuration: a tiny kernel image is materialized from bytes embedded at build time, paired with an empty block device acting as root, and referenced from generated JSON. On one architecture the embedded kernel is a statically linked, minimal stub that spins forever; on another it is a header-sized blob satisfying the platform’s expected boot image layout. This keeps template and fingerprint workflows usable in CI or developer machines without mandating real guest images.
 
@@ -20,9 +20,9 @@
 
 3. **Template dump: from live CPU state to template-shaped JSON**
 
-   3.1. The dump path locks the constructed `Vmm`, asks it to export the current CPU configuration for all vCPUs, and takes the first CPU’s snapshot as representative. That snapshot is an architecture-specific `CpuConfiguration`: on Intel/AMD-style hosts it comprises a normalized CPUID table and a map of MSR index to 64-bit value; on AArch64 hosts it comprises the guest register vector exposed by KVM for the vCPU.
+   3.1. The dump path locks the constructed monitor, asks it to export the current CPU configuration for all vCPUs, and takes the first CPU’s snapshot as representative. That snapshot is an architecture-specific CPU configuration snapshot: on Intel/AMD-style hosts it comprises a normalized CPUID table and a map of MSR index to 64-bit value; on AArch64 hosts it comprises the guest register vector exposed by KVM for the vCPU.
 
-   3.2. The conversion to a `CustomCpuTemplate` is intentionally mechanical: every exported leaf/subleaf/register or MSR index becomes a modifier entry whose “value and mask” semantics match the template schema (bitmaps describe which bits are relevant and what values they should take after masking).
+   3.2. The conversion into the JSON template schema is intentionally mechanical: every exported leaf/subleaf/register or MSR index becomes a modifier entry whose “value and mask” semantics match the template format (bitmaps describe which bits are relevant and what values they should take after masking).
 
    3.3. **x86_64-specific shaping.** CPUID entries are emitted as one leaf modifier per `(leaf, subleaf, flags)` group, with up to four register modifiers inside (EAX/EBX/ECX/EDX), preserving KVM’s per-leaf flags. The MSR list is filtered before serialization: ranges associated with time-varying counters, machine-check and PMU-related MSRs that the VMM does not meaningfully expose, and other high-churn or unsupported values are dropped so dumps focus on stable, comparable state. On AMD hosts an additional exclusion applies to an architecture-capability MSR that KVM emulates on Intel-class systems but which the product stack deliberately hides on AMD via CPUID policy—dumping it would add noise. Remaining MSRs are sorted by index for deterministic output.
 
@@ -66,7 +66,7 @@
 
    8.1. Throughout, CPUID on x86 is treated as a flat map keyed by the full qualifier (leaf, subleaf, flags, register) because the hypervisor’s leaf structures group registers together; flattening enables uniform algorithms. MSRs and AArch64 registers use a single numeric key with an opaque id formatting for error messages.
 
-   8.2. `RegisterValueFilter` semantics are consistent: comparisons always apply `value & filter` on both sides, so partial-bit templates only assert the bits they care about.
+   8.2. Modifier entries pair a value with a bitmask (“filter”) in a consistent way: comparisons always apply bitwise AND of value and mask on both sides, so partial-bit templates only assert the bits they care about.
 
    8.3. A small trait layer abstracts how numeric types render bit-diff strings for error messages, walking bit positions from most to least significant and emitting spaces where bits match and carets where they differ.
 
@@ -95,8 +95,8 @@
                               |
                               v
                     +-------------------+
-                    | Build VMM +       |
-                    | VmResources       |
+                    | Build monitor +   |
+                    | machine resources |
                     | (empty seccomp)   |
                     +---------+---------+
                               |
@@ -104,8 +104,8 @@
           |                                       |
           v                                       v
  +----------------+                    +----------------------+
- | dump_cpu_config|                    | fingerprint extras   |
- | -> template    |                    | (uname, sysfs, DMI)  |
+ | export CPU     |                    | fingerprint extras   |
+ | config -> tmpl |                    | (uname, sysfs, DMI)  |
  |   conversion   |                    +----------+-----------+
  +--------+-------+                               |
           |                                       v
@@ -123,14 +123,14 @@
 12. **Data-flow diagram (template verify)**
 
 ```
-  Firecracker JSON ------> VmResources ------> merged CustomCpuTemplate
-        |                                              |
-        |                                              |
-        v                                              v
-   build_microvm -------------------------------> dump_cpu_config()
+  Firecracker JSON ------> machine resources ------> merged custom template
+        |                                                   |
+        |                                                   |
+        v                                                   v
+   boot-time microVM build -----------------------> export CPU configuration
                                                         |
                                                         v
-                                                 CustomCpuTemplate
+                                                 template-shaped dump
                                                         |
                                                         v
                     verify: template masked values  ==  dump masked values
