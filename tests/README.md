@@ -1,660 +1,190 @@
-# Firecracker Integration Tests
+# Firecracker Python integration test system — architecture
 
-The tests herein are meant to uphold the security, quality, and performance
-contracts of Firecracker.
+## 1. Purpose and quality contract
 
-## Running
+1.1. The Python integration layer exists to exercise Firecracker end-to-end on real Linux/KVM hosts: it drives the VMM through the same HTTP API and host affordances that operators use, rather than linking against internal Rust APIs (those are covered separately by native tests in the Rust tree).
 
-The testing system is built around [pytest](https://docs.pytest.org/en/latest/).
-Our `tools/devtool` script is a convenience wrapper which automatically
-downloads necessary test artifacts from S3, before invoking pytest inside a
-docker container. For detailed help on usage, see `tools/devtool help`.
+1.2. The suite encodes three overlapping contracts:
 
-To run all available tests that would also run as part of our PR CI (e.g.
-excluding tests marked with `pytest.mark.nonci`):
+1.2.1. **Correctness** — guest-visible behavior (boot, virtio devices, networking, snapshots, CPU templates, metadata services, signals, logging) matches expectations across supported guest kernels and configuration dimensions.
 
-```sh
-tools/devtool -y test
-```
+1.2.2. **Security posture** — seccomp filters, jailer containment, dependency and vulnerability policy, and configuration that reduces attack surface behave as intended; some checks compare “before vs after” a change rather than against a static golden file.
 
-To run only tests from specific directories and/or files:
+1.2.3. **Performance and operability** — latency, throughput, boot time, memory overhead, and rate limiting stay within tracked bounds; long-running statistical comparisons can run outside the default pull-request gate.
 
-```sh
-tools/devtool -y test -- integration_tests/performance/test_boottime.py
-```
+1.3. Tests are designed to be **hermetic at the microVM boundary**: each test receives fresh processes, fresh network namespaces from a pool, and (by default) freshly built or explicitly supplied binaries. Failures trigger best-effort capture of host and guest-visible diagnostics into per-test artifact directories when structured reporting is enabled.
 
-To run a single specific test from a file:
+---
 
-```sh
-tools/devtool -y test -- integration_tests/performance/test_boottime.py::test_boottime
-```
+## 2. Orchestration model (pytest-centric)
 
-Note that all paths should be specified relative to the `tests` directory, _not_
-the repository root.
+2.1. **Discovery and phases** — The runner treats each test function as an independent unit with explicit setup, execution, and teardown phases. Hooks attach global environment metadata to every result, record per-phase duration and outcome, and forward coarse metrics to a metrics sink (with suppression on worker processes when distributed execution is used).
 
-Alternatively, pytest provides the option to run all tests where the test name
-contains some substring via the `-k` option:
+2.2. **Gating semantics** — Two marker dimensions carve the suite:
 
-```sh
-tools/devtool -y test -- -k 1024 integration_tests/performance/test_boottime.py::test_boottime
-```
+2.2.1. Tests excluded from default continuous integration (scheduled or manual pipelines only).
 
-This is particularly useful for specifying parameters of test functions. For
-example, the above command will run all boottime tests with a microVM size of
-1024MB.
+2.2.2. Tests that run in optional pipelines: failures surface issues but do not block merges by default.
 
-If you are not interested in the capabilities of `devtool`, use pytest directly,
-either from inside the container:
+2.2.3. Everything unmarked is part of the merge-critical path.
 
-```sh
-tools/devtool -y shell -p
-pytest [<pytest argument>...]
-```
+2.3. **Session isolation** — Each pytest session allocates a unique temporary root under a well-known base path so concurrent jobs on shared bare-metal hosts do not collide. Session-scoped fixtures compile small native helpers once per session and reuse them across tests.
 
-or natively on your dev box:
+2.4. **Privilege and hardware assumptions** — The suite expects superuser capability on the host (namespaces, device access, performance tuning in specialized suites) and a working KVM device. Without these, large parts of the design cannot function.
 
-```sh
-python3 -m pytest [<pytest argument>...]
-```
+2.5. **Time bounds** — A default per-test timeout prevents hung VMMs or stuck I/O from blocking pipelines indefinitely; individual long-running checks (formal verification invocations, exhaustive proofs) override with explicit extended limits.
 
-### Output
+---
 
-Output, including testrun results, goes to `stdout`. Errors go to `stderr`. By
-default, stdout and stderr are captured while tests are running and are printed
-in the final failure report only if they fail. To print them while running
-regardless of success or failure, pass the `-s` flag, e.g.
-`tools/devtool -y test -- -s`.
+## 3. Cross-cutting observability
 
-### Dependencies
+3.1. **Host fingerprinting** — At session start, the framework captures a structured snapshot of the machine: CPU vendor and model strings, microcode, host kernel version tuple, libc, Rust toolchain, optional cloud instance metadata, and source control identity when available. These properties are duplicated into per-test reports to make flaky or environment-specific failures diagnosable after the fact.
 
-- A bare-metal `Linux` host with `uname -r` >= 5.10 and KVM enabled (`/dev/kvm`
-  device node exists)
-- Docker
-- `awscli` version 2
+3.2. **Structured reporting** — When JSON reporting is enabled, each test can write artifacts into a directory keyed by test identity; those directories are intended for upload alongside the machine-readable test report.
 
-## Rust Integration Tests
+3.3. **Phase-aware metrics** — For each test item, metrics are emitted at the granularity of setup, call, and teardown, with dimensions that allow aggregation by exact node identifier, by test name without parameters, by host kernel, and globally. Duration and binary pass/fail counters are recorded per phase.
 
-The `pytest`-powered integration tests rely on Firecracker's HTTP API for
-configuring and communicating with the VMM. Alongside these, the `vmm` crate
-also includes several [native-Rust integration tests](../src/vmm/tests/), which
-exercise its programmatic API without the HTTP integration. `Cargo`
-automatically picks up these tests when `cargo test` is issued. They also count
-towards code coverage.
+---
 
-To run *only* the Rust integration tests:
+## 4. Fixture architecture and parametrization strategy
 
-```bash
-cargo test --test integration_tests --all
-```
+4.1. **Factory pattern for microVMs** — Tests do not construct processes by hand. A factory binds three concerns: which Firecracker and jailer binaries to run, how network isolation is obtained, and optional default CPU template injection. The factory tracks all VMs it created so teardown can terminate them deterministically.
 
-Unlike unit tests, Rust integration tests are each run in a separate process.
-`cargo` also packages them in a new crate. This has several known side effects:
+4.2. **Binary selection** — By default the factory uses release binaries produced by the Rust build for the host architecture. An override path allows swapping in prebuilt pairs for regression testing across releases without recompiling the tree under test.
 
-1. Only the `pub` functions can be called. This is fine, as it allows the VMM to
-   be consumed as a programmatic user would. If any function is necessary but
-   not `pub`, please consider carefully whether it conceptually *needs* to be in
-   the public interface before making it so.
+4.3. **Network namespace reuse** — Creating and destroying network namespaces for every test would be slow and can leave transient kernel state. A session-scoped pool hands out namespaces, tracks whether a namespace is still in use, and returns idle namespaces to the pool. Each parallel worker maintains its own pool to avoid cross-worker races.
 
-1. The correct functioning scenario of the `vmm` implies that it `exit`s with
-   code `0`. This is necessary for proper resource cleanup. However, `cargo`
-   doesn't expect the test process to initiate its own demise, therefore it will
-   not be able to properly collect test output.
+4.4. **Guest kernel matrix** — Supported guest kernels are discovered from the artifact store using pattern and regex filters that include special cases (for example, legacy firmware paths that remain supported until policy removes them). Parametrization expands tests across all matched kernels so compatibility is continuously enforced.
 
-   Example:
+4.5. **Root filesystem modes** — A read-only squashfs image is the default for broad compatibility tests; a writable ext4 image is used where tests must mutate the guest filesystem (for example, to inject helpers or collect logs) or where kernel debug variants are required.
 
-   ```bash
-   cargo test --test integration_tests
-   running 3 tests
-   test test_setup_serial_device ... ok
-   ```
+4.6. **CPU template coverage** — Static templates, repository-defined custom templates, and the absence of a template are treated as orthogonal axes. Template names are recorded as properties for reporting. Optional command-line injection allows repeating a suite against a single out-of-tree template without editing tests.
 
-To learn more about Rust integration test, see
-[the Rust book](https://doc.rust-lang.org/book/ch11-03-test-organization.html#integration-tests).
+4.7. **Boot vs restore construction** — Many tests need equivalent coverage for VMs that were cold-booted versus VMs resumed from a snapshot: a shared constructor path builds a running VM, captures a snapshot, tears down the first process, and restores into a second process. This catches bugs in snapshot metadata, device reinitialization, and migration of guest-visible state.
 
-## A/B-Tests
+4.8. **Dimension combinations** — “Minimal” fixtures fix kernel and rootfs to reduce Cartesian explosion for tests that do not need multi-kernel coverage. “Broad” fixtures intentionally multiply kernels, templates, and boot/restore paths to stress compatibility.
 
-A/B-Testing is a testing strategy where some test function is executed twice in
-different environments (the _A_ and _B_ environments), and the overall test
-result depends on a comparison of these outputs of the test function in these
-two environments. The advantage of A/B-testing is that it does not require the
-specification of a ground truth to compare against. It is instead dynamically
-generated by running the test function in environment _A_. Firecracker's
-A/B-testing generally compares Firecracker binaries compiled from two separate
-commits (e.g. an _A_ binary which is compiled from the HEAD of the main branch,
-and a _B_ binary which is compiled from the HEAD of a pull request opened
-against main).
+4.9. **Failure artifact capture** — If the test body fails, the framework attempts to flush in-process metrics from each VM, copy host dmesg, preserve SSH keys, copy select jailer-visible files, and persist console captures. This is best-effort: a crashed or wedged VMM might omit some artifacts.
 
-We use this testing approach if a test's ground truth...
+---
 
-- ...can change due to influence external to the code base (e.g. a security test
-  that fails if a CVE is published for one of our dependencies), or
-- ...is too complex/changes too often to reasonably be contained in the code
-  base (e.g. extensive performance benchmark results).
+## 5. MicroVM abstraction: lifecycle and control plane
 
-For examples of how to utilize A/B-testing inside an integration test, have a
-look at our [A/B-Testing module](framework/ab_test.py) or our
-[`cargo audit` test](integration_tests/security/test_sec_audit.py).
+5.1. **Process and jail** — Starting a microVM spawns the jailer (or equivalent isolation wrapper) so the VMM runs with constrained mount namespace, dropped privileges, and seccomp profile as production would. The abstraction tracks socket paths, chroot locations, and per-VM identifiers.
 
-If such an A/B-Test is executed outside of the context of a PR (meaning there is
-no canonical choice of _A_ and _B_ to be made), it will simply try to assert the
-state of the environment in which it was executed (e.g. the `cargo audit` test
-above when run on a PR will fail iff a newly added dependency has a known open
-RustSec advisory. If run outside a PR, it will fail if any existing dependency
-has an open RustSec advisory).
+5.2. **HTTP over Unix domain sockets** — The control plane speaks REST-shaped JSON over a Unix socket. The client keeps a connection pool sized below the server’s advertised connection limit to avoid races where the server must reject new connections while tearing down old ones.
 
-### Functional A/B-Tests
+5.3. **Resource configuration** — VM objects expose composable configuration steps: boot source, machine sizing, drives, network interfaces, entropy, ballooning, logging, metrics, MMDS versions, CPU templates, huge-page settings, and snapshot-related flags. High-level helpers apply opinionated “basic configs” for common cases.
 
-Firecracker has some functional A/B-tests (for example, in
-`test_vulnerabilities.py`), which generally compare the state of the pull
-request target branch (e.g. `main`), with the PR head. However, when running
-these locally, pytest does not know anything about potential PRs that the commit
-the tests are being run on are contained in, and as such cannot do this
-A/B-Test. To run functional A/B-Tests locally, you need to create a "fake" PR
-environment by setting the `BUILDKITE_PULL_REQUEST` and
-`BUILDKITE_PULL_REQUEST_BASE_BRANCH` environment variables:
+5.4. **Guest interaction** — Beyond the API, tests reach the guest through SSH over the virtual NIC, virtio-vsock channels for host–guest tests, serial consoles for early-boot issues, and orchestrated `tmux`/`screen` sessions for interactive debugging workflows.
+
+5.5. **Snapshots** — Snapshot types distinguish full memory images from differential images that may require rebasing on a parent. Some modes require dirty-page tracking during execution; others use alternative memory tracking strategies. The abstraction carries disk and NIC metadata so a restored VM can reconstruct matching backend files.
+
+5.6. **Host-side monitoring** — Optional monitors attach to Firecracker’s metrics endpoint and to host memory accounting where tests validate resource behavior under load.
+
+---
+
+## 6. Host-native helpers and build integration
+
+6.1. **Compiled micro-utilities** — Small C programs are built once per session to probe behaviors that are awkward to express purely in Python: virtio-vsock ping-pong, MMIO config space mutation, instruction set features, synthetic jailer timing, and MSR reads. These binaries are linked or compiled with flags that force specific code generation when testing CPU features.
+
+6.2. **Rust workspace integration** — Helpers invoke `cargo` to build examples (for seccomp demonstrations), snapshot manipulation tools, and to locate target binaries under the configured musl release layout.
+
+6.3. **Kernel-building tools** — Performance and correctness tests may shell out to compile ancillary eBPF or tracing tools when validating host-side semantics.
+
+---
+
+## 7. Reference data (fixtures, not code)
+
+7.1. **Metadata service payloads** — Versioned JSON documents model the guest-visible metadata schema, including deliberately invalid fragments for negative testing.
+
+7.2. **CPU template fingerprints** — For each supported host CPU flavor, canonical CPUID-derived fingerprints capture what the CPU template machinery should synthesize or mask; tests diff live behavior against these expectations.
+
+7.3. **Custom template documents** — JSON definitions describe vendor-specific guest CPU models for Firecracker’s custom template feature, covering both x86 and AArch64 feature bundles.
+
+7.4. **Model-specific register enumerations** — Tabular exports list model-specific registers exposed to guests for particular host/guest kernel combinations, enabling parity checks after changes to CPU modeling.
+
+---
+
+## 8. Integration test taxonomy (behavioral layers)
+
+8.1. **Functional** — Exercises API workflows, virtio block and network stacks, vsock, balloon, entropy, RTC, serial, signals, logging, MMDS, CPU feature bits, UFFD-driven memory, snapshots and editors, and cross-kernel restore compatibility. These tests prioritize behavioral correctness over raw speed.
+
+8.2. **Performance** — Measures boot time, network throughput, block I/O, vsock latency, memory overhead, rate limiters, huge-page effects, jailer overhead, snapshot restore latency, and process startup time. Many emit embedded metrics time series rather than hard-coded thresholds so results can be analyzed statistically in dedicated pipelines.
+
+8.3. **Security** — Validates seccomp profiles (including custom profiles), jailer confinement, dependency auditing, and vulnerability baselines. Some tests are comparative: they only fail when a change introduces *new* risk relative to a baseline revision.
+
+8.4. **Repository hygiene** — Static checks enforce formatting, OpenAPI drift, license headers, Markdown policy, Python style, and git commit message rules. These are fast, deterministic, and mostly host-independent.
+
+8.5. **Build and analysis hooks** — A separate cluster of tests shells into `cargo` for Clippy, unit tests, coverage thresholds, redundant seccomp rule detection, GDB scripts, and dependency graphs. They validate engineering constraints rather than runtime guest behavior.
+
+8.6. **Formal methods** — Where enabled in heavy CI, a dedicated test invokes the Kani Rust verifier across harnesses with long timeouts and captures the full log for archival.
+
+---
+
+## 9. A/B and comparative testing philosophy
+
+9.1. **Git A/B** — Some security and policy tests execute the same probe on two checkouts: typically the merge base or main branch versus the candidate change. Equality of structured outputs means “no new regressions introduced by this diff”; divergence flags a genuine policy change worth human review.
+
+9.2. **Binary A/B for performance** — Performance tests can emit metrics without asserting absolute SLOs. An external orchestrator runs the same pytest selection twice against two Firecracker builds, aligns metric series by dimensions, and applies non-parametric statistical tests to highlight regressions or improvements.
+
+9.3. **Dimension discipline for metrics** — Embedded metrics carry dimensions that must uniquely identify parameterized cases; otherwise statistical aggregation merges incompatible series. Tests include parameters in dimension sets and use a stable performance-test key to map A and B runs.
+
+9.4. **Local replay of analyses** — Emitting metrics to a local sink allows capturing reports for offline comparison between arbitrary environments, not only between compiled binaries.
+
+---
+
+## 10. Parallelism, isolation, and scheduling constraints
+
+10.1. **Worker safety** — Distributed execution is supported, but not all tests are safe to interleave: those that rebuild heavy artifacts, mutate global host performance settings, or rely on exclusive hardware characteristics may require serial execution or dedicated hosts.
+
+10.2. **Noisy neighbors** — Default CI may share bare-metal hosts across jobs; tests must not assume exclusive access to host-global knobs unless they live in suites that request single-tenant machines.
+
+---
+
+## 11. End-to-end data flow (conceptual)
 
 ```
-BUILDKITE_PULL_REQUEST=true BUILDKITE_PULL_REQUEST_BASE_BRANCH=main ./tools/devtool test -- integration_tests/security/test_vulnerabilities.py
+                    ┌─────────────────────────────────────┐
+                    │  Test runner session + global props │
+                    └──────────────┬──────────────────────┘
+                                   │
+           ┌───────────────────────┼───────────────────────┐
+           │                       │                       │
+           v                       v                       v
+   ┌───────────────┐     ┌────────────────┐      ┌───────────────┐
+   │ Fixture graph │     │ Host helpers   │      │ Metrics +     │
+   │ (kernels,     │     │ (C utilities,  │      │ JSON reports  │
+   │  templates,   │     │  cargo tools)  │      │               │
+   │  snapshots)   │     └────────┬───────┘      └───────────────┘
+   └───────┬───────┘              │
+           │                      │
+           v                      v
+   ┌───────────────────────────────────────────┐
+   │ MicroVM factory → jailer + Firecracker    │
+   │ HTTP API configuration + guest probes     │
+   └───────────────────────┬───────────────────┘
+                           │
+                           v
+                  ┌────────────────┐
+                  │ Guest workload │
+                  │ (SSH, vsock,   │
+                  │  virtio I/O)   │
+                  └────────────────┘
 ```
 
-### Performance A/B-Tests
+---
 
-Firecracker has a special framework for orchestrating long-running A/B-tests
-which run outside the pre-PR CI. Instead, these tests are scheduled to run
-post-merge. Specific tests, such as our
-[snapshot restore latency tests](integration_tests/performance/test_snapshot.py)
-contain no assertions themselves, but rather they emit data series using the
-`aws_embedded_metrics` library. When executed by the
-[`tools/ab_test.py`](../tools/ab_test.py) orchestration script, these data
-series are collected. The orchestration script executes each test twice with
-different Firecracker binaries, and then matches up corresponding data series
-from the _A_ and _B_ run. For each data series, it performs a non-parametric
-test. For each data series where the difference between the _A_ and _B_ run is
-considered statically significant, it will print out the associated metric.
-Please see `tools/ab_test.py --help` for information on how to configure what
-the script considers significant.
+## 12. Relationship to other test layers
 
-Writing your own A/B-Test is easy: Simply write a test that outputs a data
-series and has no functional assertions. Then, when this test is run under the
-A/B-Test orchestrator, all data series emitted will be picked up automatically
-for statistical analysis.
+12.1. **Rust integration tests in the VMM crate** validate programmatic APIs and process lifecycle without HTTP; they complement this suite by covering surfaces tests here cannot see.
 
-To add a new A/B-Test to our post-PR test suite, add the corresponding test
-function to [`.buildkite/pipeline_perf.py`](../.buildkite/pipeline_perf.py). To
-manually run an A/B-Test, use
+12.2. **Unit tests throughout the workspace** provide fast feedback; failures there are cheaper than reproducing issues through full KVM paths.
 
-```sh
-tools/devtool -y test --ab [optional arguments to ab_test.py] run <dir A> <dir B> --pytest-opts <test specification>
-```
+---
 
-Here, _dir A_ and _dir B_ are directories containing firecracker and jailer
-binaries whose performance characteristics you wish to compare. You can use
-`./tools/devtool build --rev <revision> --release` to compile binaries from an
-arbitrary git object (commit SHAs, branches, tags etc.). This will create
-sub-directories in `build` containing the binaries. For example, to compare
-boottime of microVMs between Firecracker binaries compiled from the `main`
-branch and the `HEAD` of your current branch, run
+## 13. Further reading
 
-```sh
-tools/devtool -y build --rev main --release
-tools/devtool -y build --rev HEAD --release
-tools/devtool -y test --no-build --ab -- run build/main build/HEAD --pytest-opts integration_tests/performance/test_boottime.py::test_boottime
-```
+13.1. The reusable Python framework that implements microVM construction, API clients, artifacts, and A/B helpers is documented in its own README for deeper implementation detail.
 
-#### How to Write an A/B-Compatible Test and Common Pitfalls
-
-First, **A/B-Compatible tests need to emit more than one data point for each
-metric for which they wish to support A/B-testing**. This is because
-non-parametric tests operate on data series instead of individual data points.
-
-When emitting metrics with `aws_embedded_metrics`, each metric (data series) is
-associated with a set of dimensions. The `tools/ab_test.py` script uses these
-dimension to match up data series between two test runs. It only matches up two
-data series with the same name if their dimensions match.
-
-Special care needs to be taken when pytest expands the argument passed to
-`tools/ab_test.py`'s `--pytest-opts` option into multiple individual test cases.
-If two test cases use the same dimensions for different data series, the script
-will fail and print out the names of the violating data series. For this reason,
-**A/B-Compatible tests should include a `performance_test` key in their
-dimension set whose value is set to the name of the test**.
-
-In addition to the above, care should be taken that the dimensions of the data
-series emitted by some test case are unique to that test case. For example, if
-we have a boottime test parameterized by number of vcpus, but the emitted
-boottime data series' dimension set is just
-`{"performance_test": "test_boottime"}`, then `tools/ab_test.py` will not be
-able to tell apart data series belonging to different microVM sizes, and instead
-combine them (which is probably not desired). For this reason **A/B-Compatible
-tests should always include all pytest parameters in their dimension set.**
-
-Lastly, performance A/B-Testing through `tools/ab_test.py` can only detect
-performance differences that are present in the Firecracker binary. The
-`tools/ab_test.py` script only checks out the revisions it is passed to execute
-`cargo build` to generate a Firecracker binary. It does not run integration
-tests in the context of the checked out revision. In particular, both the _A_
-and the _B_ run will be triggered from within the same docker container, and
-using the same revision of the integration test code. This means it is not
-possible to use orchestrated A/B-Testing to assess the impact of, say, changing
-only python code (such as enabling logging). Only Rust code can be A/B-Tested.
-The exception to this are toolchain differences. If both specified revisions
-have `rust-toolchain.toml` files, then `tools/ab_test.py` will compile using the
-toolchain specified by the revision, instead of the toolchain installed in the
-docker container from which the script is executed.
-
-### A/B-Testing in Buildkite
-
-We run automated A/B-Tests on every pull request after merge, if the pull
-request touches any rust code. The pipeline is generated by the
-[`pipeline_perf.py`](../.buildkite/pipeline_perf.py) script. To manually
-schedule an A/B-Test in buildkite, the `REVISION_A` and `REVISION_B` environment
-variables need to be set in the "Environment Variables" field under "Options" in
-buildkite's "New Build" modal.
-
-### Beyond commit comparisons
-
-While our automated A/B-Testing suite only supports A/B-Tests across commit
-ranges, you can also use the scripts to manually run A/B-comparisons for
-arbitrary environment (such as comparison how the same Firecracker binary
-behaves on different hosts).
-
-For this, run the desired tests in your environments using `devtool` as you
-would for a non-A/B test. The only difference to a normal test run is you should
-set two environment variables: `AWS_EMF_ENVIRONMENT=local` and
-`AWS_EMF_NAMESPACE=local`:
-
-```sh
-AWS_EMF_ENVIRONMENT=local AWS_EMF_NAMESPACE=local tools/devtool -y test -- integration_tests/performance/test_boottime.py::test_boottime
-```
-
-This instructs `aws_embedded_metrics` to dump all data series that our A/B-Test
-orchestration would analyze to `stdout`, and pytest will capture this output
-into a file stored at `./test_results/test-report.json`.
-
-The `tools/ab_test.py` script can consume these test reports, so next collect
-your two test report files to your local machine and run
-
-```sh
-tools/ab_test.py analyze <first test-report.json> <second test-report.json>
-```
-
-This will then print the same analysis described in the previous sections.
-
-#### Troubleshooting
-
-If during `tools/ab_test.py analyze` you get an error like
-
-```bash
-$ tools/ab_test.py analyze <first test-report.json> <second test-report.json>
-Traceback (most recent call last):
-  File "/firecracker/tools/ab_test.py", line 412, in <module>
-    data_a = load_data_series(args.report_a)
-  File "/firecracker/tools/ab_test.py", line 122, in load_data_series
-    for line in test["teardown"]["stdout"].splitlines():
-KeyError: 'stdout'
-```
-
-double check that the `AWS_EMF_ENVIRONMENT` and `AWS_EMF_NAMESPACE` environment
-variables are set to `local`. Particularly, when collecting data from buildkite
-pipelines generated from `.buildkite/pipeline_perf.py`, ensure you pass
-`--step-param env/AWS_EMF_NAMESPACE=local --step-param env/AWS_EMF_SERVICE_NAME=local`!
-
-## Adding Python Tests
-
-Tests can be added in any (existing or new) sub-directory of `tests/`, in files
-named `test_*.py`.
-
-### Fixtures
-
-By default, `pytest` makes all fixtures in [`conftest.py`](../tests/conftest.py)
-available to all test functions. You can also create `conftest.py` in
-sub-directories containing tests, or define fixtures directly in test files. See
-the [`pytest` documentation](https://docs.pytest.org/en/6.2.x/fixture.html) for
-details.
-
-Most integration tests use fixtures that abstract away the creation and teardown
-of Firecracker processes. The following fixtures spawn Firecracker processes
-that are pre-initialized with specific guest kernels and rootfs:
-
-- `uvm_plain_any` is parametrized by the guest kernels
-  [supported](../docs/kernel-policy.md) by Firecracker and a read-only Ubuntu
-  24.04 squashfs as rootfs,
-- `uvm_plain` yields a Firecracker process pre-initialized with a 5.10 kernel
-  and the same Ubuntu 24.04 squashfs.
-- `uvm_any` yields started microvms, parametrized by all supported kernels, all
-  CPU templates (static, custom and none), and either booted or restored from a
-  snapshot.
-- `uvm_any_booted` works the same as `uvm_any`, but only for booted VMs.
-
-Generally, tests should use `uvm_plain_any` if you are testing some interaction
-between the guest and Firecracker, and `uvm_plain` should be used if Firecracker
-functionality unrelated to the guest is being tested.
-
-### Markers
-
-Firecracker uses two special
-[pytest markers](https://pytest.org/en/7.4.x/example/markers.html) to determine
-which tests are run in which context:
-
-- Tests marked as `nonci` are not run in the PR CI pipelines. Instead, they run
-  in separate pipelines according to various cron schedules.
-- Tests marked as `no_block_pr` are run in the "optional" PR CI pipeline. This
-  pipeline is not required to pass for merging a PR.
-
-All tests without markers are run for every pull request, and are required to
-pass for the PR to be merged.
-
-## Adding Rust Tests
-
-Add a new function annotated with `#[test]` in
-[`integration_tests.rs`](../src/vmm/tests/integration_tests.rs).
-
-## Working With Guest Files
-
-There are helper methods for writing to and reading from a guest filesystem. For
-example, to overwrite the guest init process and later extract a log:
-
-```python
-def test_with_any_microvm_and_my_init(test_microvm_any):
-    # [...]
-    test_microvm_any.slot.fsfiles['mounted_root_fs'].copy_to(my_init, 'sbin/')
-    # [...]
-    test_microvm_any.slot.fsfiles['mounted_root_fs'].copy_from('logs/', 'log')
-```
-
-`copy_to()` source paths are relative to the host root and destination paths are
-relative to the `mounted_root_fs` root. Vice versa for `copy_from()`.
-
-Copying files to/from a guest file system while the guest is running results in
-undefined behavior.
-
-## Example Manual Testrun
-
-Running on an EC2 `.metal` instance with an `Amazon Linux 2` AMI:
-
-```sh
-# Get firecracker
-yum install -y git
-git clone https://github.com/firecracker-microvm/firecracker.git
-
-# Run all tests
-cd firecracker
-tools/devtool test
-```
-
-## CI Environment
-
-In our CI, integration tests are run on EC2 `.metal` instances. We list the
-instance types and host operating systems we test in
-[our `README`](../README.md#tested-platforms). Multiple test runs can share a
-`.metal` instance, meaning it is possible to observe noisy neighbor effects when
-running the integration test suite (and particularly, tests should not assume
-the ability to configure host-global resources). The exception to this are
-integration tests found in
-[`integration_tests/performance`](integration_tests/performance). These tests
-are always executed single-tenant, and additionally tweak various host-level
-setting to achieve consistent performance. Please see the `test` section of
-`tools/devtool help` for more information.
-
-## Terminology
-
-- **Testrun**: A sandboxed run of all (or a selection of) integration tests.
-- **Test Session**: A `pytest` testing session. One per **testrun**. A
-  **Testrun** will start a **Test Session** once the sandbox is created.
-- **Test**: A function named `test_` from this tree, that ensures a feature,
-  functional parameter, or quality metric of Firecracker. Should assert or raise
-  an exception if it fails.
-- **Fixture**: A function that returns an object that makes it very easy to add
-  **Tests**: E.g., a spawned Firecracker microvm. Fixtures are functions marked
-  with `@pytest.fixture` from a files named either `conftest.py`, or from files
-  where tests are found. See `pytest` documentation on fixtures.
-- **Test Case**: An element from the cartesian product of a **Test** and all
-  possible states of its parameters (including its fixtures).
-
-## FAQ
-
-`Q1:` *I have a shell script that runs my tests and I don't want to rewrite
-it.*\
-`A1:` Insofar as it makes sense, you should write it as a python test function.
-However, you can always call the script from a shim python test function. You
-can also add it as a microvm image resource in the s3 bucket (and it will be
-made available under `microvm.slot.path`) or copy it over to a guest filesystem
-as part of your test.
-
-`Q2:` *I want to add more tests that I don't want to commit to the Firecracker
-repository.*\
-`A2:` Before a testrun or test session, just add your test directory under
-`tests/`. `pytest` will discover all tests in this tree.
-
-`Q3:` *I want to have my own test fixtures, and not commit them in the repo.*\
-`A3:` Add a `conftest.py` file in your test directory, and place your fixtures
-there. `pytest` will bring them into scope for all your tests.
-
-`Q4:` *I want to use more/other microvm test images, but I don't want to add
-them to the common s3 bucket.*\
-`A4:` Add your custom images to the `build/img` subdirectory in the Firecracker
-source tree. This directory is bind-mounted in the container and used as a local
-image cache.
-
-`Q5:` *How can I get live logger output from the tests?*\
-`A5:` Accessing **pytest.ini** will allow you to modify logger settings.
-
-`Q6:` *Is there a way to speed up integration tests execution time?*\
-`A6:` You can narrow down the test selection as described in the **Running**
-section. For example:
-
-1. Pass the `-k substring` option to pytest to only run a subset of tests by
-   specifying a part of their name.
-1. Only run the tests contained in a file or directory.
-
-## Implementation Goals
-
-- Easily run tests manually on a development/test machine, and in a continuous
-  integration environments.
-- Each test should be independent, and self-contained. Tests will time out,
-  expect a clean environment, and leave a clean environment behind.
-- Always run with the latest dependencies and resources.
-
-### Choice of Pytest & Dependencies
-
-Pytest was chosen because:
-
-- Python makes it easy to work in the clouds.
-- Python has built-in sandbox (virtual environment) support.
-- `pytest` has great test discovery and allows for simple, function-like tests.
-- `pytest` has powerful test fixture support.
-
-## Test System TODOs
-
-**Note**: The below TODOs are also mentioned in their respective code files.
-
-### Features
-
-- Use the Firecracker Open API spec to populate Microvm API resource URLs.
-- Event-based monitoring of microvm socket file creation to avoid while spins.
-- Self-tests (e.g., Tests that test the testing system).
-
-### Implementation
-
-- Looking into `pytest-ordering` to ensure test order.
-- Create an integrated, layered `say` system across the test runner and pytest
-  (probably based on an environment variable).
-- Per test function dependency installation would make tests easier to write.
-- Type hinting is used sparsely across tests/\* python module. The code would be
-  more easily understood with consistent type hints everywhere.
-
-### Bug fixes
-
-## Further Reading
-
-Contributing to this testing system requires a dive deep on `pytest`.
-
-## Troubleshooting tests
-
-When troubleshooting tests, it is important to only narrow down the ones that
-are of interest. One can use the `--last-failed` parameter to only run the tests
-that failed from the previous run. Useful when several tests fail after making
-large changes.
-
-### Run tests from within the container
-
-To avoid having to enter/exit Docker every test run, you can run the tests
-directly within a Docker session:
-
-```sh
-tools/devtool -y shell --privileged
-tools/test.sh integration_tests/functional/test_api.py
-```
-
-### How to use the Python debugger (pdb) for debugging
-
-Just append `--pdb`, and when a test fails it will drop you in pdb, where you
-can examine local variables and the stack, and can use the normal Python REPL.
-
-```
-tools/devtool -y test -- -k 1024 integration_tests/performance/test_boottime.py::test_boottime --pdb
-```
-
-### How to use ipython's ipdb instead of pdb
-
-```sh
-tools/devtool -y shell --privileged
-export PYTEST_ADDOPTS=--pdbcls=IPython.terminal.debugger:TerminalPdb
-tools/test.sh -k 1024 integration_tests/performance/test_boottime.py::test_boottime
-```
-
-There is a helper command in devtool that does just that, and is easier to type:
-
-```sh
-tools/devtool -y test_debug -k 1024 integration_tests/performance/test_boottime.py::test_boottime
-```
-
-### How to connect to the console interactively
-
-There is a helper to enable the console, but it has to be run **before**
-spawning the Firecracker process:
-
-```python
-uvm.help.enable_console()
-uvm.spawn()
-uvm.basic_config()
-uvm.start()
-...
-```
-
-Once that is done, if you get dropped into pdb, you can do this to open a `tmux`
-tab connected to the console (via `screen`).
-
-```python
-uvm.help.tmux_console()
-```
-
-### How to reproduce intermittent (aka flaky) tests
-
-Just run the test in a loop, and make it drop you into pdb when it fails.
-
-```sh
-while true; do
-    tools/devtool -y test -- integration_tests/functional/test_balloon.py::test_deflate_on_oom -k False --pdb
-done
-```
-
-### How to run tests in parallel with `-n`
-
-We can run the tests in parallel via `pytest-xdist`. Not all tests can run in
-parallel (the ones in `build` and `performance` are not supposed to run in
-parallel).
-
-By default, the tests run sequentially. One can use the `-n` to control the
-parallelism. Just `-n` will run as many workers as CPUs, which may be too many.
-As a rough heuristic, use half the available CPUs. I use -n4 for my 8 CPU
-(HT-enabled) laptop. In metals 8 is a good number; more than that just gives
-diminishing returns.
-
-```sh
-tools/devtool -y test -- integration_tests/functional -n$(expr $(nproc) / 2) --dist worksteal
-```
-
-### How to attach gdb to a running uvm
-
-First, make the test fail and drop you into PDB. For example:
-
-```sh
-tools/devtool -y test_debug integration_tests/functional/test_api.py::test_api_happy_start --pdb
-```
-
-Then,
-
-```
-ipdb> test_microvm.help.gdbserver()
-```
-
-You get some instructions on how to run GDB to attach to gdbserver.
-
-## How to run tests with a different version of Firecracker
-
-The integration tests usually compile Firecracker as part of the test
-initialization. But there's an option in case we want to run the tests against a
-different version of Firecracker, for example a previous release:
-
-```sh
-./tools/devtool test -- --binary-dir ../v1.8.0
-```
-
-The directory specified with `--binary-dir` should contain at least two
-binaries: `firecracker` and `jailer`.
-
-## How to run tests outside of Docker
-
-Tested in Ubuntu 22.04 and AL2023. AL2 does not work due to an old Python (3.8).
-
-```sh
-# replace with yum in Fedora/AmazonLinux
-sudo apt install python3-pip
-sudo pip3 install pytest ipython requests psutil tenacity filelock "urllib3<2.0" requests_unixsocket aws_embedded_metrics pytest-json-report pytest-timeout
-cd tests
-sudo env /usr/local/bin/pytest integration_tests/functional/test_api.py
-```
-
-> :warning: **Notice this runs the tests as root!**
-
-## Sandbox
-
-```sh
-tools/devtool -y sandbox
-```
-
-That should drop you in an IPython REPL, where you can interact with a microvm:
-
-```python
-uvm.help.print_log()
-uvm.get_all_metrics()
-uvm.ssh.run("ls")
-snap = uvm.snapshot_full()
-uvm.help.tmux_ssh()
-```
-
-It supports a number of options, you can check with `devtool sandbox -- --help`.
-
-### Running outside of Docker
-
-Running without Docker
-
-```
-source /etc/os-release
-case $ID-$VERSION_ID in
-amzn-2)
-    sudo yum remove -y python3
-    sudo amazon-linux-extras install -y python3.8
-    sudo ln -sv /usr/bin/python3.8 /usr/bin/python3
-    sudo ln -sv /usr/bin/pip3.8 /usr/bin/pip3
-esac
-
-sudo pip3 install pytest ipython requests psutil tenacity filelock "urllib3<2.0" requests_unixsocket
-
-sudo env PYTHONPATH=tests HOME=$HOME ~/.local/bin/ipython3 -i tools/sandbox.py -- --binary-dir ../repro/v1.4.1
-```
-
-> [!WARNING]
->
-> **Notice this runs as root!**
+13.2. Operational commands (container entrypoints, developer scripts, artifact downloads) live at the repository tooling layer and intentionally stay out of this architecture note.
