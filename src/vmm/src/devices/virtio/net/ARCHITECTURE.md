@@ -41,10 +41,11 @@ The following diagram situates the major buffers and directions without naming i
                     +--+-------------+--+
                        |             |
            +-----------+             +------------+
-           | readv from TAP         | writev to TAP
+           | vector read from TAP   | vector write to TAP
            v                        v
     +------+------+           +-----+------+
-    | Host TAP fd |           | Host TAP fd |
+    | Host TAP    |           | Host TAP    |
+    | device      |           | device      |
     +-------------+           +-------------+
            ^                        |
            |                        |
