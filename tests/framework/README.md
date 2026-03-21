@@ -1,162 +1,216 @@
 # Python integration test framework
 
-1. **Purpose and scope**
+## 1. Purpose and scope
 
-   1.1. The Python integration test framework is the programmatic layer that drives Firecracker end-to-end in automated tests: it launches the VMM under the jailer, configures guests through the HTTP control plane, attaches storage and networking, exercises lifecycle operations (boot, pause, snapshot, restore), and tears everything down deterministically. It is not a standalone product; it is the glue between pytest (or similar runners), host tooling (network namespaces, SSH, process control), and the Firecracker binaries.
+1.1. The Python integration test framework is the programmatic layer that drives Firecracker end-to-end in automated tests: it launches the VMM under the jailer, configures guests through the HTTP control plane, attaches storage and networking, exercises lifecycle operations (boot, pause, snapshot, restore), and tears everything down deterministically. It is not a standalone product; it is the glue between the test runner, host tooling (network namespaces, SSH, process control), and the Firecracker binaries.
 
-   1.2. Design goals include: strict validation of API outcomes (failures surface as test failures with rich context), reproducible isolation per VM (separate network namespaces and chroots), minimal surprise around asynchronous startup (polling and retries at well-defined boundaries), and optional observability hooks (logs, metrics, memory sampling, latency checks) that can be turned off when they would add noise (for example under parallel test workers).
+1.2. Design goals include: strict validation of API outcomes (failures surface as test failures with rich context), reproducible isolation per VM (separate network namespaces and chroots), minimal surprise around asynchronous startup (polling and retries at well-defined boundaries), and optional observability hooks (logs, metrics, memory sampling, latency checks) that can be turned off when they would add noise—for example under parallel test workers where timing assertions become meaningless.
 
-2. **Layered architecture**
+---
 
-   2.1. At the highest level, tests obtain a **factory** that knows where release-quality or workspace-built `firecracker` and `jailer` binaries live. The factory mints **microVM handles**, each with a unique identity, an associated **jailer context** (chroot layout, UID/GID, daemonize vs. interactive mode, cgroup hooks), and a **network namespace** for TAP devices and SSH to the guest.
+## 2. Pytest integration surface (what the framework assumes)
 
-   2.2. Once spawned, each microVM exposes an **HTTP API client** bound to the Unix domain socket inside the jail. That client is organized as REST-shaped resources (machine configuration, boot source, drives, network interfaces, VM actions, snapshots, optional entropy, balloon, vsock, MMDS, etc.). The client uses HTTP over Unix sockets with a connection pool sized to stay just under the server’s concurrent-connection limit, avoiding a class of “server full” races when connections churn.
+2.1. **Runner-first contract.** The framework is consumed almost exclusively through pytest fixtures defined at the test-tree root: a session-scoped temporary directory, a session-scoped network-namespace factory, and a function-scoped factory object that yields microVM handles. Tests rarely import core types directly except in specialized subtrees; instead they depend on parametrized fixtures for kernels, root filesystems, CPU templates, and boot-vs-restore constructors.
 
-   2.3. A **helpers** surface (conceptually separate from the core lifecycle object) supports interactive debugging: how to SSH, how to attach debuggers, how to enable serial consoles via `screen`, and ad-hoc networking tricks (for example bridging a guest TAP to the wider host for ingress). These helpers mutate launch parameters (for example disabling daemonization) and are meant for developer workflows more than CI determinism.
+2.2. **Property recording.** The runner’s property-recording hook is wrapped so that key-value pairs propagate both into machine-readable reports and into the embedded metrics logger. Custom templates, selected guest kernel stems, and binary identities thus appear consistently in downstream dashboards without each test manually duplicating calls.
 
-   2.4. Cross-cutting utilities implement **host command execution** with consistent logging, **CPU topology mapping** for containers, **process lifetime** helpers (pidfd-based wait), **screen** orchestration for console tests, and small **MMDS** curl builders. Additional focused modules cover vhost-user block backends, CPU template naming, IMDS-like HTTP from guests, and optional ftrace/iperf/vsock conveniences—each extending the core without bloating the central object.
+2.3. **Failure-aware teardown.** The factory’s finalizer consults phase reports: only when the *call* phase failed does it attempt an expanded diagnostic capture (metrics flush, host ring-buffer text, chroot file copies, console buffers). Successful tests still run full VM teardown but skip expensive preservation work.
 
-3. **Jailer integration and filesystem view**
+2.4. **Command-line extensions.** The framework cooperates with extra options for overriding binary directories and injecting a custom CPU template file for entire sessions. Those options are parsed once per session and flow into factory construction so individual tests do not reimplement policy.
 
-   3.1. Each microVM’s jailer context captures everything needed to construct a correct command line: identity string, executable path, UID/GID, chroot base, optional network namespace path, whether to detach as a daemon, whether to create a new PID namespace, cgroup-related parameters, and an open-ended map of Firecracker-specific flags that appear after `--` in the jailer invocation.
+2.5. **Interaction with distributed execution.** When multiple workers run in parallel, each worker owns its own session directory, its own namespace pool, and its own compiled helper binaries. Locks around shared filesystem mutations (for example cloning reference trees or hardlinking release artifacts) serialize only the critical sections that would otherwise race across workers.
 
-   3.2. The **chroot layout** follows the jailer’s contract: a per-VM directory under the chroot base, containing a `root` tree where linked artifacts live. The context exposes the full host path to the API socket (defaulting under `run/` inside the jail) and the path to the PID file written for the jailed Firecracker process.
+2.6. **Diagram: runner hooks and framework objects.**
 
-   3.3. **Resource publication** into the jail is implemented by hardlinking (when source and jail are on the same device) or copying (when they are not), optionally creating block special nodes, then `chown`ing to the jail UID/GID. The returned path is always the **in-jail** absolute path (string beginning with `/`) suitable for API payloads. This keeps tests honest about what the VMM actually sees while avoiding unnecessary duplication when hardlinks work.
+```
+  pytest session start
+         │
+         ├─► session temp root (unique per session)
+         ├─► compile helper C binaries into session root
+         └─► netns factory (per worker id)
+                    │
+                    v
+         per-test: factory + results_dir + metrics
+                    │
+                    v
+              microVM handle(s)
+                    │
+                    v
+         teardown: phase report → conditional artifact capture → kill sweep
+```
 
-   3.4. **Cleanup** walks cgroup controllers associated with the VM when configured: it waits until tasks files are empty (with bounded retries), then removes the per-VM cgroup directories. This complements test-level `SIGKILL` of Firecracker by reducing leftover kernel cgroup state.
+---
 
-4. **Process launch modes and readiness**
+## 3. Layered architecture inside the library
 
-   4.1. Two launch paths exist: **daemonized** jailer (Firecracker fully detached; tests talk only to the API socket and logs) and **screen-wrapped** jailer (Firecracker’s stdio attached to a `screen` session so serial console traffic lands in a log file). A new PID namespace interacts with the screen path: Firecracker may reparent such that the screen supervisor exits; the framework clears the remembered screen PID to avoid killing an unrelated process.
+3.1. **Factory tier.** The highest-level entry point knows where release-quality or workspace-built binaries live and how to obtain a network namespace from the pool. It mints microVM handles, each with a unique identity, an associated jailer context (chroot layout, UID/GID, daemonize vs interactive mode, cgroup hooks), and a namespace for TAP devices and SSH to the guest.
 
-   4.2. Readiness is established in layers:
+3.2. **MicroVM tier.** Once spawned, each microVM exposes an HTTP API client bound to the Unix domain socket inside the jail. Resources are modeled REST-style: machine configuration, boot source, drives, network interfaces, VM actions, snapshots, optional entropy, balloon, vsock, metadata service, and more. The client uses HTTP over Unix sockets with a connection pool sized to stay just under the server’s concurrent-connection limit, avoiding a class of “server full” races when connections churn during bursty configuration.
 
-   - If a JSON **config file** path is present in the extra arguments and at least one network interface was configured, the framework waits for **guest SSH** (see below) because that implies userspace is far enough along for most tests.
+3.3. **Helpers tier (orthogonal).** Interactive debugging support—SSH attachment, debugger hooks, serial consoles via terminal multiplexers, bridging guests to wider host networks—lives conceptually beside the core lifecycle object. These helpers mutate launch parameters (for example disabling daemonization) and favor developer workflows over CI determinism.
 
-   - Else, if the API is enabled (no `no-api` flag), and logging is verbose enough, it waits for a log line stating the API server started; if logging is too quiet for that, it polls for the API socket file with retries.
+3.4. **Cross-cutting utilities.** Host command execution with consistent logging, CPU topology mapping for containerized environments, process lifetime helpers, small HTTP builders for guest metadata probes, optional tracing or iperf conveniences, and vhost-user backend orchestration each extend the core without bloating the central object.
 
-   - Else, if logging still provides boot messages, it looks for a generic “running” line; otherwise the caller is responsible for synchronization.
+---
 
-   4.3. **Optional NUMA binding** is achieved by prepending `numactl` (or similar) command fragments ahead of the jailer invocation, so the entire jailer/Firecracker stack inherits policy without the Python code needing to know VMM internals.
+## 4. Jailer integration and filesystem view
 
-5. **HTTP control plane client**
+4.1. **Context record.** Each microVM’s jailer context captures everything needed to construct a correct command line: identity string, executable path, UID/GID, chroot base, optional network namespace path, whether to detach as a daemon, whether to create a new PID namespace, cgroup-related parameters, and an open-ended map of VMM-specific flags that the jailer passes through to the Firecracker executable after the double-hyphen separator.
 
-   5.1. The client wraps a small resource abstraction: each resource knows its path, whether it carries an identifier in the URL (for example drives keyed by id), and how to issue `GET`, `PUT`, or `PATCH`. Non-204 responses deserialize JSON error bodies and raise with the fault string when present—tests therefore fail loudly on unexpected API errors instead of silently proceeding.
+4.2. **Chroot layout.** The layout follows the jailer’s contract: a per-VM directory under the chroot base, containing a root tree where linked artifacts live. The context exposes the full host path to the API socket (defaulting under the runtime directory inside the jail) and the path to the PID file written for the jailed Firecracker process.
 
-   5.2. The Unix socket session mounts a dedicated adapter with a **bounded connection pool** (one less than the server’s advertised maximum). The rationale is subtle: when the pool evicts connections, close and open events can reorder at the kernel level; keeping headroom avoids spurious “server full” conditions during bursty test traffic.
+4.3. **Resource publication.** Publishing block files or kernels into the jail uses hardlinking when source and jail share a device, or copying when they do not, optionally creating block special nodes, then changing ownership to the jail UID/GID. Returned paths are always absolute *inside* the jail (leading slash) so API payloads match what the VMM truly sees.
 
-   5.3. The top-level API object also wires an **error callback** used by the microVM to dump diagnostics whenever a low-level request exception occurs (socket issues, deserialization problems). That ties transport failures to the same debug bundle as SSH failures.
+4.4. **Cgroup cleanup.** Teardown walks cgroup controllers when configured: waits until task lists are empty with bounded retries, then removes per-VM cgroup directories. This complements brute-force process termination by reducing leftover kernel state.
 
-6. **Guest configuration shortcuts**
+---
 
-   6.1. A “basic configuration” path applies machine settings (vCPU count, SMT flag, memory, optional dirty-page tracking for differential snapshots, huge-page policy), records the intended memory size for later metrics labels, optionally starts a memory sampling helper, then configures the boot source (kernel path, optional initrd, command line). Root filesystem attachment is optional but typical: read-only mode is inferred from squashfs images.
+## 5. MicroVM lifecycle in depth
 
-   6.2. **CPU templates** support both named static templates (string identifiers) and structured custom templates posted to the dedicated CPU configuration endpoint. Template naming is normalized for telemetry dimensions.
+5.1. **Launch modes.** Two primary paths exist: daemonized jailer (Firecracker fully detached; tests interact only via API socket and log files) and terminal-multiplexer–wrapped jailer (stdio attached so serial console traffic lands in a scrollback file). Interaction between new PID namespaces and the multiplexer path matters: the supervised process may exit early while Firecracker reparents, so the framework clears stale supervisor PIDs to avoid signaling the wrong process during teardown.
 
-   6.3. **Block devices** can be file-backed (linked into the jail) or **vhost-user** sockets. For vhost-user, the framework spawns an external backend process, waits until its socket appears, `chown`s the socket into the jail, and registers the drive with the socket form of the API. Replacing a vhost-user drive id kills the previous backend first to avoid orphaned processes.
+5.2. **Readiness layering.** Readiness is not monolithic. If a JSON config file is injected and at least one network interface exists, waiting for guest SSH is the strongest gate—userspace and networking are far enough along for most workloads. If the API is enabled without that combination, the framework may wait for log lines proving the API socket is live, or poll for the socket file with backoff. Quiet log settings push responsibility to the caller for synchronization. Optional NUMA binding is implemented by prepending policy wrappers ahead of the jailer so the entire stack inherits affinity without embedding policy inside HTTP payloads.
 
-7. **Networking and guest access**
+5.3. **Configuration sequence.** Typical setup applies machine sizing (vCPU count, SMT flag, memory, optional dirty tracking for differential snapshots, huge-page policy), records memory size for later metric labels, optionally starts memory sampling, then configures boot source (kernel, optional initrd, command line). Root filesystem attachment infers read-only mode from squashfs vs writable ext4. CPU templates may be static names or structured JSON posted to the CPU configuration endpoint; names normalize for telemetry.
 
-   7.1. Each TAP is created inside the microVM’s network namespace with a host IPv4 address and prefix derived from a structured interface description object (guest MAC, guest IP, TAP name, etc.). The framework stores both the high-level config and the TAP handle for later snapshot restores and SSH.
+5.4. **Block and backend lifetimes.** File-backed drives link into the jail. Vhost-user drives spawn an external backend, wait for its socket, change ownership on the socket into the jail, then register the drive. Replacing a vhost-user identifier kills the previous backend first to avoid orphaned host processes—a subtle ordering rule that prevents teardown races.
 
-   7.2. **SSH** uses a persistent connection object bound to the namespace, the private key copied alongside the rootfs, a control master socket path colocated with the chroot, and the same diagnostic callback as the API client. The first access to a given interface index constructs and caches the connection; the framework tracks all open connections to close them before killing Firecracker.
+5.5. **Networking.** Each TAP is created inside the microVM’s network namespace with host and guest addresses derived from a structured interface object. The framework retains both high-level config and TAP handles for snapshot restore and SSH. SSH uses a persistent connection bound to the namespace, private keys copied beside the root filesystem, and a control master socket colocated with the chroot; connections cache per interface index and must close before Firecracker exits cleanly.
 
-   7.3. **Waiting for SSH** is the default “guest is usable” gate after `InstanceStart` when interfaces exist. It ensures initialization completed, not merely that the VMM thread scheduled.
+5.6. **Snapshots: kinds and files.** Snapshots bundle vmstate, memory images, disk id-to-path maps, network interface records, SSH key material, snapshot kind (full vs differential variants), and free-form metadata (kernel path, vCPU count). Full snapshots are self-contained. Differential kinds require dirty tracking to have been enabled before capture; some variants require rebasing incremental files onto a base using either a dedicated rebase binary or an editor tool. One differential variant aligns with mincore-oriented hypervisor behavior; local enums distinguish these cases so tests cannot accidentally mix semantics.
 
-8. **Snapshots: data model and operations**
+5.7. **Snapshot create and restore.** Creation pauses the VM first, then calls the snapshot endpoint with paths relative to the jail. Serialization to a directory copies or hardlinks components and writes a JSON manifest. Restore copies files into a fresh jail with distinct basenames to avoid clobbering golden inputs, recreates TAP devices from saved objects, hardlinks disks, then posts a load request. Memory backends may be plain files or userfaultfd sockets; the latter publishes an external page-fault handler into the jail, executes it with dropped privileges matching the jail user, and wires its socket as the memory backend. Optional network override maps rename host-side TAPs for compatibility across baseline vs candidate binaries in comparative runs.
 
-   8.1. Snapshots are first-class immutable bundles: vmstate file, memory image, captured disk map (ids to paths), list of network interface configs, ssh key material, snapshot **kind** (full vs. differential variants), and arbitrary metadata (kernel path, vCPU count, etc.).
+5.8. **Userfaultfd path.** The handler runs jailed, logs to a dedicated file, ensures executable permissions inside the chroot, and listens on a fixed socket path. Firecracker connects as a client; ownership must match the jail UID/GID after creation. Startup failure surfaces log contents immediately because silent hangs here obscure root causes (bad paths, seccomp denials).
 
-   8.2. **Kinds** differ in external requirements:
+5.9. **Multi-VM and chain scenarios.** The factory remembers every VM for a coordinated kill: stop monitors, close SSH, terminate vhost-user backends, signal Firecracker and any multiplexer supervisor, wait on modern wait primitives, optionally assert no stray identity processes remain, terminate userfaultfd helpers, optionally validate API latency from logs, remove chroots when safe. A generator pattern can restore many VMs from one snapshot or walk incremental chains: yield a running VM to the test, optionally capture the next layer, delete superseded files to save disk, tear down, repeat—supporting stress without manual bookkeeping.
 
-   - Full snapshots are self-contained memory images.
+5.10. **Serial and interactive testing.** When not daemonized, Firecracker output goes to a multiplexer log file. A serial helper polls that file, injects keystrokes via the multiplexer’s input command, and reads with deadlines that fail the test and kill the VM on excessive delay. A small state machine matches incremental input against target strings for firmware menus without fragile full-string compares on bursty I/O.
 
-   - Differential kinds require dirty page tracking to have been enabled before taking them, and may require **rebasing** incremental memory files onto a base layer using either a dedicated rebase binary or a snapshot editor tool—tests pick the mechanism explicitly.
+5.11. **Lifecycle swimlane (conceptual).**
 
-   - One differential variant pairs with **mincore** behavior at the hypervisor level; the same API string maps to distinct enum values locally so tests can choose semantics precisely.
+```
+  test code                framework                     host / guest
+      │                         │                            │
+      ├─ build VM handle ───────►                            │
+      ├─ configure API ─────────► configuration requests ───► VMM applies
+      ├─ start ─────────────────► explicit start action ─────► boot
+      │                         ├─ wait SSH / socket / log ──► userspace ready
+      ├─ workload / assert ─────► SSH / vsock / virtio ─────► guest
+      ├─ snapshot? ─────────────► pause + create ────────────► disk files
+      ├─ restore? ──────────────► new process + load ───────► resume
+      └─ implicit teardown ─────► ordered kill + cgroup/ns ─► clean host
+```
 
-   8.3. **Creation** pauses the VM first (to quiesce devices), then calls the snapshot creation endpoint with on-disk paths relative to the jail. Returned object paths are anchored at the chroot root on the host.
+---
 
-   8.4. **Serialization** to a directory copies or hardlinks vmstate, memory, ssh key, and disks, then writes a JSON manifest mapping logical names to filenames plus all structured fields. Deserialization rebuilds the snapshot object for restore pipelines.
+## 6. Observability, guardrails, and failure modes
 
-   8.5. **Restore** copies snapshot files into a fresh jail with distinct basenames to avoid clobbering golden artifacts, recreates TAP devices from saved interface objects (initially without issuing API calls), hardlinks disks, then posts a load request. Memory backends are either plain files or **userfaultfd** sockets: when the latter, an external page-fault handler binary is published into the jail, executed inside the chroot with dropped privileges matching the jail user, and its socket is wired as the memory backend. Optional **network override** maps allow renaming host-side TAP devices for compatibility across baseline vs. candidate binaries in A/B comparisons.
+6.1. **Logging and API latency.** Verbose logging enables parsing of per-request durations from the log stream; the framework can assert ceilings on API handling time for synchronous operations, with long operations like snapshots exempt. When parallel workers contend for CPUs, these checks disable by default because wall-time noise dominates signal.
 
-9. **Userfaultfd restore path**
+6.2. **Metrics files.** Optional newline-delimited JSON metrics can be linked into the jail and flushed via API; readers tolerate partial trailing writes from crash mid-flush.
 
-   9.1. The handler process runs jailed, logs to a dedicated file, chmods the binary executable inside the chroot, and listens on a fixed socket path. Firecracker connects as a client; the framework ensures the socket is owned by the jail UID/GID after creation.
+6.3. **Memory monitors.** Optional sampling validates memory behavior on shutdown—useful for ballooning or leak regressions.
 
-   9.2. Failure to start fails fast with log contents printed to the console stream, because silent hangs here mask root causes (bad snapshot path, seccomp issues, etc.).
+6.4. **Debug dumps.** Low-level HTTP exceptions route through an error callback tied to microVM diagnostics. On failure, the framework may collect Firecracker logs, userfaultfd logs, and thread stack traces scraped from the kernel’s thread listings for every VMM thread—unless the VM was already known dead. Transport failures thus surface alongside guest SSH failures in a unified troubleshooting story.
 
-10. **Factories and multi-VM snapshot scenarios**
+6.5. **Invariant-style failure categories.**
 
-    10.1. The factory remembers every VM it created so a single `kill` sweep tears down all instances: stop monitors, close SSH, terminate vhost-user backends, `SIGKILL` Firecracker and any lingering screen supervisor, wait on pidfds, optionally validate no stray jailer-id processes remain, kill UFFD handlers, validate API latency if enabled, and finally `rmtree` the chroot if safe.
+6.5.1. **Misconfiguration before start** — invalid API payloads raise immediately; there is no silent fallback.
 
-    10.2. Building from a snapshot spawns a fresh VM and immediately loads the snapshot with resume, optionally with UFFD.
+6.5.2. **Hung readiness** — outer test timeouts fire; inner polls have bounded retries but cannot escape a wedged hypervisor.
 
-    10.3. A **generator** pattern can restore many VMs from the same snapshot or walk an incremental chain: each iteration builds a VM, restores, yields it to the test, optionally takes the next snapshot (rebasing differentials as needed), deletes superseded files to conserve disk, kills the VM, and finally deletes the last snapshot artifacts. This supports stress and longevity scenarios without manual bookkeeping.
+6.5.3. **Partial teardown** — kill sweeps are ordered, yet kernel or device bugs can still leave namespaces or files behind; best-effort cleanup logs are not always actionable.
 
-11. **Serial console testing**
+6.5.4. **Comparative tests** — git-based A/B clones a reference revision to a temporary workspace using a branch trick so arbitrary commitishes materialize without mutating the developer tree; lock contention or disk exhaustion surfaces as test failures distinct from product bugs.
 
-    11.1. When not daemonized, Firecracker output goes to a `screen` log file. A small **serial** helper polls that file with `select`, sends keystrokes via `screen`’s `stuff` command, and reads either character-by-character or line-delimited with a timeout that fails the test and kills the VM on excessive delay.
+---
 
-    11.2. A companion **state machine** layer matches incremental input against target strings character-wise, enabling scripted boot menus or firmware interactions without fragile full-string compares on bursty console IO.
+## 7. Artifacts, discovery, and versioning
 
-12. **Observability and guardrails**
+7.1. **Kernel and disk discovery.** Guest kernels and root filesystems resolve from a machine-specific artifact root with a fallback when shared storage is absent. Regex allowlists keep special kernels (for example ACPI-less variants) opt-in. Parametrized fixtures record normalized stem properties for reporting dimensions.
 
-    12.1. **Logging**: if enabled, Firecracker logs to a host-visible file also linked into the jail. Log level interacts with optional **API latency assertions**: only debug-level logs carry the paired “request received” / “total duration” lines the framework correlates. Those assertions parse the log stream sequentially (requests are processed synchronously, so ordering is stable), convert microseconds to milliseconds, and enforce a hard ceiling except for intentionally long operations like snapshot endpoints.
+7.2. **Release binaries as parameters.** Shipped Firecracker builds can be discovered, version-sorted, capped relative to the workspace’s next minor boundary, and fed as pytest parameters alongside the workspace-built tip linked to mirror release naming—so performance suites treat local builds like another release channel.
 
-    12.2. **Parallel pytest workers** disable API latency checks by default because timing becomes noisy when the host is contended—environment variables signaling `xdist` worker counts flip that switch.
+7.3. **Snapshot format version.** When snapshot formats decouple from semantic versioning, the binary exposes a dedicated version query; tests gate behavior on that string when comparing across baselines.
 
-    12.3. **Metrics**: optional newline-delimited JSON metrics files can be linked and flushed via an API action; helpers iterate valid JSON lines defensively (tolerating partial trailing writes).
+7.4. **Static reference data.** JSON payloads for invalid metadata, CPU template fingerprints per host flavor, custom template documents for multiple architectures, and CSV register enumerations live alongside tests as versioned inputs—not as code—to keep assertions data-driven.
 
-    12.4. **Memory monitors** attach when requested and validate collected samples on shutdown—useful for leak or ballooning regressions.
+---
 
-    12.5. **Debug dumps** on failures bundle Firecracker logs, optional UFFD logs, and **thread stack traces** scraped from `/proc` for every Firecracker thread—unless the VM was already marked dead cleanly.
+## 8. Host assumptions the framework makes
 
-13. **Thread and CPU controls**
+8.1. **Privilege and devices.** Root-equivalent capability, accessible KVM, and namespace/cgroup operations are assumed for normal integration tests. Seccomp demonstration builds invoke the Rust workspace to produce example binaries; that assumes a working toolchain layout.
 
-    13.1. For performance isolation experiments, helpers enumerate threads by name via `psutil`, then set affinities using a **CPU map** that translates logical indices to the actual host CPUs visible to cgroups—critical in Docker where `/proc/cpuinfo` lies about available cores.
+8.2. **Container vs bare metal.** CPU maps translate logical indices to cgroup-visible CPUs because container views of processor lists can diverge from hardware reality; affinity helpers depend on that mapping for reproducible pinning experiments.
 
-    13.2. Convenience methods pin all vCPUs to consecutive cores, then place VMM and API threads on the next two cores, returning the next free core index for additional host workloads.
+8.3. **Network reachability for optional probes.** Cloud metadata endpoints may be absent; code paths guard probes so local laptops do not fail purely for lacking a cloud environment.
 
-14. **Artifacts, versioning, and pytest parametrization**
+---
 
-    14.1. Guest kernels and root filesystems are discovered under a machine-specific artifact directory (with a documented fallback when shared storage is absent). Kernels are filtered by regex allowlists so special variants (for example ACPI-less builds) remain opt-in.
+## 9. Performance-oriented features vs functional defaults
 
-    14.2. Firecracker release binaries are globbed, parsed for semantic versions, capped to the workspace’s next minor boundary, and exposed as pytest parameters. The **current workspace build** is also advertised as an artifact by hardlinking the built `firecracker`/`jailer` to version-suffixed names that mirror release layout—letting performance and compatibility tests treat “tip” like a normal release.
+9.1. **Thread and CPU controls.** For throughput or latency experiments, helpers enumerate threads by name, map them through the cgroup-aware CPU map, and pin VMM, API, and vCPU threads to disjoint cores—returning free cores for paired host workloads. This machinery exists to stabilize performance tests; functional tests often ignore pinning unless the behavior under test is scheduling-sensitive.
 
-    14.3. Snapshot **version strings** for a given binary can be queried via a dedicated flag when Firecracker decoupled snapshot formats from release numbers; tests use that to gate behavior across baselines.
+9.2. **Metrics emission without assertions.** Performance modules frequently record series into the embedded metrics sink with dimensions that include guest kernel stem, rootfs label, vCPU count, and memory size—copied from a process-wide host properties singleton plus per-VM configuration. Functional modules use the same sink for pass/fail counts but rely on explicit assertions for correctness.
 
-15. **Global environment properties**
+9.3. **Statistical helpers.** The framework exposes permutation-style hypothesis testing utilities so callers can compare two samples (for example baseline vs candidate throughput) without embedding fixed p-value thresholds in every test file.
 
-    15.1. A process-wide singleton captures immutable host metadata: CPU vendor, model name, codename, microcode, kernel version (several granularities), OS pretty name, libc and Rust toolchain versions, optional Buildkite identifiers, PR vs. non-PR mode, git commit/branch when available, and EC2 instance metadata when the environment responds to IMDSv2 probes.
+9.4. **A/B infrastructure.** Git-based A/B runs a callable twice across revisions and compares with pluggable equality or subset constraints. Binary-directory A/B skips git and compares runs against different prebuilt artifact directories—ideal for snapshot compatibility matrices. Host-command A/B tightens stdout/stderr equality in pull-request CI while relaxing outside CI for faster local iteration.
 
-    15.2. MicroVMs derive **CloudWatch-style dimensions** from this singleton plus per-VM configuration (guest kernel stem, rootfs name, vCPU count, memory size) for consistent metrics tagging in CI.
+9.5. **Separation summary.**
 
-16. **A/B testing infrastructure**
+```
+  Concern              │ Functional emphasis          │ Performance emphasis
+  ─────────────────────┼──────────────────────────────┼────────────────────────
+  Primary signal       │ Asserted state / output      │ Measured distributions
+  Typical fixture      │ Broad kernel/template matrix │ Release binary params,
+                       │                              │ pinned CPUs, warmups
+  Runner sensitivity   │ Tolerates parallelism        │ May disable latency
+                       │                              │ parsing when distributed
+```
 
-    16.1. **Motivation**: some checks are inherently unstable against absolute baselines (security audit outputs drift as the advisory database changes) but still must catch PR-induced deltas. **A/B tests** run the same procedure twice—on a reference revision and on the candidate—and compare outputs with a pluggable comparator.
+---
 
-    16.2. **Git-based A/B** clones the repository to a temporary path for revision A (defaults to the PR base branch in CI, else `main`), runs the user-supplied callable there, runs again at the working tree for B, then compares. Cloning uses a short-lived local branch trick to materialize arbitrary commitishes without mutating the developer’s checkout.
+## 10. HTTP control plane client (behavioral summary)
 
-    16.3. **Binary-directory A/B** skips git entirely: callers point one run at a directory of release-tagged binaries and the other at the default cargo output tree—ideal for snapshot compatibility across shipped artifacts vs. local builds.
+10.1. **Strict errors.** Resources know how to issue reads and writes; non-empty error responses deserialize JSON bodies and raise with fault text when present—tests fail loudly on unexpected API errors instead of silently proceeding.
 
-    16.4. **Host command A/B** wraps shell pipelines: in PR CI, stdout/stderr must match across revisions; outside PRs, the command simply must succeed—keeping local workflows fast while preserving gating where it matters.
+10.2. **Connection pool rationale.** When the pool evicts connections, close and open events can reorder at the kernel level; keeping headroom below the advertised server limit avoids spurious “server full” conditions during bursty test traffic.
 
-    16.5. **Set non-growth** comparators parse command output into sets and require the candidate’s set to be a subset of the reference’s set—useful for “no new vulnerable crates” style assertions.
+10.3. **Error callback.** Transport-level failures tie into the same diagnostic path as SSH failures so operators see a single coherent bundle.
 
-    16.6. **Statistical regression testing** for performance exposes a permutation test over two sample populations, returning a full hypothesis-test object so callers can threshold p-values for noisy metrics.
+---
 
-17. **Concurrency control**
+## 11. Static analysis and heavy tools
 
-    17.1. Certain git and artifact operations are wrapped in **file locks** keyed only by callable name (a known caveat if two functions share a name). The lock serializes access across parallel pytest workers that would otherwise race cloning or hardlinking shared binaries.
+11.1. **Seccomp introspection.** A separate module disassembles binaries, tracks syscall numbers through simplified register reasoning, and compares against installed policies to flag redundant rules. It is intentionally isolated from the hot path of booting guests.
 
-18. **Static analysis helpers (seccomp introspection)**
+---
 
-    18.1. Separately, a static analysis module (invoked by specialized tests) disassembles binaries, tracks syscall numbers through simplified register backtracking, and compares observed syscalls against installed seccomp policies to flag redundant rules. This is heavy machinery kept isolated from the hot path of normal integration tests.
+## 12. Behavioral invariants worth relying on
 
-19. **End-to-end data flow (typical test)**
+12.1. API calls that should succeed are checked strictly; there is no silent fallback when the control plane errors.
+
+12.2. Snapshot operations that need the VM paused perform the pause explicitly—tests do not depend on implicit pausing side effects.
+
+12.3. Differential snapshot types that need rebasing encode that requirement in the type system so misuse raises before touching disks.
+
+12.4. Kill ordering prefers stopping external backends before Firecracker when both exist, avoiding socket races during teardown.
+
+12.5. When userfaultfd is enabled, memory backends switch from file paths to the userfaultfd socket transparently to the rest of restore logic—only the backend descriptor changes.
+
+---
+
+## 13. Extensibility model
+
+13.1. New device types generally arrive as additional API resources plus optional host-side helpers (for example a new virtio backend process). The core microVM object should only gain thin forwarding logic; heavier orchestration belongs in focused utility modules.
+
+13.2. New CI dimensions should extend the global host properties singleton cautiously—everything constructed there runs once per process and must remain side-effect free beyond probing.
+
+---
+
+## 14. End-to-end data flow (typical test)
 
 ```
   +------------------+       build / select       +------------------+
@@ -175,25 +229,7 @@
            | Guest (SSH/serial)| <------ TAP -------- |     devices      |
            +------------------+                         +------------------+
 
-   teardown: stop monitors -> close SSH -> kill vhost-user -> SIGKILL FC
-             -> wait pidfd -> verify no stray PIDs -> optional latency parse
+   teardown: stop monitors -> close SSH -> kill vhost-user -> fatal signal FC
+             -> wait on waitable handles -> verify no stray PIDs -> optional latency parse
              -> cleanup cgroups/netns/chroot
 ```
-
-20. **Behavioral invariants worth relying on**
-
-    20.1. API calls that should succeed are checked strictly; there is no “best effort” silent fallback when the control plane errors.
-
-    20.2. Snapshot operations that need the VM paused perform the pause explicitly—tests do not depend on implicit pausing side effects.
-
-    20.3. Differential snapshot types that need rebasing encode that requirement in the type system so misuse raises before touching disks.
-
-    20.4. Kill ordering prefers stopping **external backends** before Firecracker when both exist, avoiding socket races during teardown.
-
-    20.5. When UFFD is enabled, memory backends switch from file paths to the userfaultfd socket transparently to the rest of the restore logic—only the backend descriptor changes.
-
-21. **Extensibility model**
-
-    21.1. New device types generally arrive as additional API resources plus optional host-side helpers (for example a new virtio backend process). The core microVM object should only gain thin forwarding logic; heavier orchestration belongs in focused utility modules.
-
-    21.2. New CI dimensions should extend the global properties singleton cautiously—everything constructed there runs once per process and must remain side-effect free beyond probing.
