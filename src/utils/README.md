@@ -4,7 +4,7 @@
 
    1.1. The crate is a small, dependency-light Rust library that centralizes cross-cutting concerns for a VMM-style process: reading Linux kernel clocks, formatting human-readable local timestamps, validating identifiers used across components, and parsing long-form command-line options with relational constraints (required, mutually exclusive, and co-requisite flags).
 
-   1.2. Design emphasis is on predictable, POSIX-aligned behavior on Linux: time reads go through the standard monotonic/realtime/CPU-time clocks where appropriate; local calendar rendering uses the C library’s local-time conversion from realtime seconds; CLI parsing follows GNU-style long options and a dedicated end-of-options sentinel.
+   1.2. Design emphasis is on predictable, POSIX-aligned behavior on Linux: time reads go through standard monotonic, realtime, and process/thread CPU-time clocks where appropriate; local calendar rendering uses the C library’s local-time conversion from realtime seconds; CLI parsing follows GNU-style long options and a dedicated end-of-options sentinel.
 
    1.3. An optional compile-time feature wires in lightweight instrumentation hooks from a sibling logging crate. When disabled, the library has no tracing-specific surface area beyond ordinary dependencies.
 
@@ -12,51 +12,63 @@
 
    2.1. **Kernel clock abstraction**
 
-   2.1.1. Four logical clock kinds are exposed as a small enumeration mapped one-to-one to Linux `clockid_t` values: monotonic wall time (not subject to NTP step adjustments in the usual sense), realtime wall time (calendar-related), process-scoped CPU time, and thread-scoped CPU time.
+   2.1.1. Four logical clock kinds are exposed as a small enumeration mapped one-to-one to POSIX clock identifiers on Linux: monotonic wall time (steady progression suitable for measuring elapsed intervals without calendar meaning), realtime wall time (the usual “wall clock” subject to administrator adjustments and meaningful for civil time), process-scoped CPU time (time charged to the process across its threads), and thread-scoped CPU time (time charged to the calling thread only).
 
-   2.1.2. Downstream code selects a clock kind when asking for nanosecond, microsecond, or millisecond granularities; all granularities derive from a single nanosecond read to avoid inconsistent rounding across units.
+   2.1.2. Downstream code selects a clock kind when asking for nanosecond, microsecond, or millisecond granularities; all granularities derive from a single nanosecond read so fractional units are consistent and not mixed from separate kernel calls that could drift relative to each other within one logical sample.
 
    2.2. **Nanosecond pipeline**
 
-   2.2.1. Reading time fills a POSIX `timespec`, then combines whole seconds (converted to nanoseconds with checked multiplication) with the fractional nanosecond field. Overflow on the second→nanosecond step is treated as a conversion failure at the API boundary for the helper that only converts seconds; the primary clock readers assume the kernel returns values that fit the expected ranges and bridge into unsigned nanosecond counts for the common case.
+   2.2.1. Reading time fills a standard POSIX time structure, then combines whole seconds (converted to nanoseconds with checked multiplication) with the fractional nanosecond field. The public second-to-nanosecond conversion returns absence on overflow; the primary clock readers assume the conversion succeeds and aggregate into an unsigned nanosecond total. Extremely large second counts that overflow the checked multiply surface as conversion failure only on the dedicated conversion helper, not on the main read path—so the documented overflow behavior differs between the thin conversion API and the clock readers, which treat impossible kernel values as a hard failure at the point of aggregation.
 
    2.2.2. Public conversion constants fix the scaling factors between seconds, milliseconds, and nanoseconds so all unit transforms share one definition of “how large a second is” in fixed-point nanoseconds.
 
+   2.2.3. Microsecond and millisecond results are obtained by integer division from the nanosecond total, so sub-unit precision is truncated toward zero rather than rounded; callers comparing microsecond output to nanosecond output divided by hand should expect exact alignment only where the division boundary allows it.
+
    2.3. **High-resolution cycle counter vs. portable clocks**
 
-   2.3.1. On x86-64, a “timestamp in cycles” path returns the raw time-stamp counter from the CPU. That is not translated to wall time in this layer—it is a cheap, high-frequency ordinal useful for relative measurements on that architecture.
+   2.3.1. On x86-64, a “timestamp in cycles” path returns the raw time-stamp counter from the CPU. That is not translated to wall time in this layer—it is a cheap, high-frequency ordinal useful for relative measurements on that architecture, with no guarantee of correspondence to seconds across cores, power states, or virtualization unless the platform provides such guarantees outside this crate.
 
    2.3.2. On non-x86-64 targets, the same entry point transparently uses monotonic nanoseconds from the kernel instead, so callers always get a monotonic increasing value without architecture-specific branching at the call site.
 
    2.4. **Local time with nanosecond display**
 
-   2.4.1. “Now” in local civil time is obtained by reading realtime into a timespec, then passing the second count through the re-entrant local-time breakdown routine. The result keeps separate fields for second, minute, hour, month day, month index, year offset since 1900, plus the timespec’s subsecond nanoseconds.
+   2.4.1. “Now” in local civil time is obtained by reading realtime into a POSIX time structure, then passing the second count through the re-entrant local-time breakdown routine. The result keeps separate fields for second, minute, hour, month day, month index, year offset since 1900, plus that structure’s subsecond nanoseconds. The effective zone and daylight-saving interpretation follow the process environment and system zone database at the moment of the call, not a caller-supplied zone.
 
-   2.4.2. Display formatting as a string follows a fixed pattern: ISO-like ordering with zero-padded month/day/hour/minute/second and a nine-digit fractional part. Month and year fields are adjusted in the formatter (month +1, year +1900) because the underlying breakdown uses zero-based month and years-since-1900, matching traditional `tm` conventions.
+   2.4.2. Display formatting as a string follows a fixed pattern: ISO-like ordering with zero-padded month/day/hour/minute/second and a nine-digit fractional part. Month and year fields are adjusted in the formatter (month +1, year +1900) because the underlying breakdown uses zero-based month and years-since-1900, matching traditional broken-down civil-time conventions.
+
+   2.4.3. Negative or leap-second edge cases are delegated entirely to the C library breakdown; the display path does not synthesize its own notion of civil time beyond formatting the fields returned.
 
    2.5. **Paired real vs. CPU microsecond snapshot**
 
-   2.5.1. A small aggregate type pairs two microsecond-scale quantities: monotonic real time and process CPU time, both obtained via the same microsecond helper. Instantiating default state samples both at construction, giving a compact “where was the process on the wall clock vs. how much CPU it had used” checkpoint for metrics or logging.
+   2.5.1. A small aggregate type pairs two microsecond-scale quantities: monotonic real time and process CPU time, both obtained via the same microsecond helper. Instantiating default state samples both at construction, giving a compact “where was the process on the wall clock vs. how much CPU it had used” checkpoint for metrics or logging. The two samples are not atomic with respect to each other beyond occurring back-to-back in the same default initializer.
 
    2.6. **Testing stance**
 
-   2.6.1. Unit tests assert monotonicity (or at least non-decreasing behavior) for repeated reads of monotonic and CPU clocks, sanity on realtime nonzero values, consistency between ns/us/ms derivations, display formatting for hand-crafted civil times, and overflow behavior on extreme second→nanosecond conversion.
+   2.6.1. Unit tests assert monotonicity (or at least non-decreasing behavior) for repeated reads of monotonic and CPU clocks, sanity on realtime nonzero values, consistency between nanosecond, microsecond, and millisecond derivations, display formatting for hand-crafted civil times, and overflow behavior on extreme second-to-nanosecond conversion.
 
 3. **Identifier validation**
 
    3.1. **Policy**
 
-   3.1.1. A dedicated validator enforces a strict character set and length window for an “instance id” string: length must fall between fixed inclusive bounds (short enough for practical UI and long enough to reject empty identifiers).
+   3.1.1. A dedicated validator enforces a strict character set and length window for an “instance id” string: the UTF-8 byte length must fall between fixed inclusive bounds (short enough for practical UI and long enough to reject empty identifiers). The check uses byte length, not grapheme or Unicode scalar count, so a string that fits the byte budget may still contain fewer logical characters if those characters use multi-byte encodings.
 
-   3.1.2. Allowed characters are ASCII letters and digits plus hyphen; any other character fails validation and reports the offending character and its byte/character index.
+   3.1.2. After length passes, the implementation scans Unicode scalar values one at a time. A character is allowed if it is a hyphen or if it satisfies the host language’s standard alphanumeric predicate for scalar values. That predicate is broader than ASCII-only letters and digits: many non-ASCII letters and numeric symbols are accepted. Callers who intend strictly host-name–style or ASCII-only labels should not rely on this validator alone for that narrower policy.
+
+   3.1.3. Hyphens are explicitly allowed and are the only non-alphanumeric punctuation guaranteed by this path; underscores, spaces, slashes, colons, and other punctuation fail with a structured error naming the first offending character.
 
    3.2. **Error model**
 
-   3.2.1. Errors are a small closed enum with structured payloads: invalid length carries actual length plus the configured min/max, invalid character carries the character and position. Display strings are generated via derive macros so user-facing messages stay stable and localized formatting can be layered consistently.
+   3.2.1. Errors are a small closed set of variants with structured payloads: invalid length carries actual length plus the configured min/max; invalid character carries the character and a zero-based index in the scalar iteration (character index, not UTF-8 byte offset). Display strings are generated automatically from those variants so user-facing messages stay stable and localized formatting can be layered consistently.
+
+   3.2.2. An empty string fails the length rule before any per-character scan, so no character-level error is reported for emptiness.
+
+   3.2.3. A string whose UTF-8 byte length exceeds the maximum fails on the length check without scanning every character, while a string that is within the length window but contains a disallowed character fails on first disallow with position information.
 
    3.3. **Operational characteristics**
 
    3.3.1. Validation is O(n) over Unicode scalar values with early exit on the first disallowed character; length is checked before scanning so overlong strings fail without a full pass when length alone violates policy.
+
+   3.3.2. Because validation accepts only well-formed UTF-8 text at the boundary, ill-formed encodings cannot appear as input; callers supply valid Unicode sequences.
 
 4. **Command-line parsing architecture**
 
@@ -68,13 +80,13 @@
 
    4.2. **Phased parse pipeline**
 
-   The following ASCII diagram summarizes control flow from raw argv to validated state:
+   The following ASCII diagram summarizes control flow from raw process arguments to validated state:
 
    ```
-   argv[0] dropped
+   program name dropped
           |
           v
-   split at first bare "--"  ---------->  extra_args[] (opaque forward)
+   split at first bare "--"  ---------->  forwarded tail (opaque)
           |
           v
    help/version present? ----yes---->  inject synthetic flag, return OK
@@ -86,65 +98,105 @@
           +-- must start with "--" else Unexpected
           +-- must be a known name else Unexpected
           +-- if value-taking: next token must exist and must NOT look like a new option
-          +-- accumulate into Flag / Single / Multiple
+          +-- accumulate into flag, single value, or multiple values
           |
           v
    validate_requirements:
           +-- every required option has a user value
-          +-- if an option with co-requisites appeared, argv must contain the co-requisite’s "--name"
-          +-- if an option forbids others, none of the forbidden "--name" tokens may appear
+          +-- if an option with co-requisites appeared, the left segment must contain the co-requisite’s long token
+          +-- if an option forbids others, none of the forbidden long tokens may appear
    ```
 
-   4.2.1. The first element of the process argument vector is always ignored as the program name. Everything after that is split at the first standalone `--` token: left side is parsed as structured options; right side is copied verbatim into an auxiliary list for the embedding application (for example forwarded guest arguments).
+   4.2.1. The first element of the process argument vector is always ignored as the program name. Everything after that is split at the first standalone end-of-options token: the left side is parsed as structured options; the right side is copied verbatim into an auxiliary list for the embedding application (for example forwarded guest arguments). Only the first such separator participates in splitting; any additional separators in the remainder stay inside the forwarded material as ordinary arguments.
 
-   4.2.2. If either standard help token appears anywhere in the left segment, parsing short-circuits: only a synthetic help flag is recorded and the rest of the line is not interpreted. The same pattern applies to a standard version token, which records only a version flag. These shortcuts guarantee help/version never trip “missing value” or “unknown option” errors on the remainder of the argv slice.
+   4.2.2. If either standard help token appears anywhere in the left segment, parsing short-circuits: only a synthetic help flag is recorded and the rest of the line is not interpreted. The same pattern applies to a standard version token, which records only a version flag. These shortcuts guarantee help and version never trip “missing value” or “unknown option” errors on the remainder of the left segment. Presence is detected by membership in the left segment, not by position, so help may appear after other tokens and still preempt full parsing.
 
    4.2.3. Otherwise, the left segment is walked sequentially. Each option must begin with the long-option prefix; the name is looked up in the registry. Duplicate appearance is rejected unless the schema explicitly allows multiple values for that name.
 
-   4.2.4. Value-taking options consume the next argv element as their value unless that element itself begins with the long-option prefix, in which case the value is considered missing—this enforces that values cannot be omitted in favor of silently treating the next flag as a value.
+   4.2.4. Value-taking options consume the next argument element as their value unless that element itself begins with the long-option prefix, in which case the value is considered missing—this enforces that values cannot be omitted in favor of silently treating the next flag as a value. A value cannot be another option token even if that token would have been invalid; the parser commits to “missing value” first.
 
-   4.2.5. After structural parsing, a second pass enforces relational constraints: required options must have been assigned a user value; conditional requirements (if A appears, B’s flag must also appear) are checked by substring presence of the required `--b` token in the original left segment; mutual exclusions are enforced symmetrically by scanning for forbidden names when a trigger option is present.
+   4.2.5. For repeatable value-taking options, each occurrence consumes its own value; repeating the name without a following non-option token yields a missing-value error rather than a duplicate-name error in that situation.
+
+   4.2.6. After structural parsing, a second pass enforces relational constraints: required options must have been assigned a user value; conditional requirements (if A appears, B’s flag must also appear) are checked by exact token equality against a synthesized expected token in the original left segment; mutual exclusions are enforced symmetrically by scanning for forbidden names when a trigger option is present. The co-requisite and forbid checks compare whole argument entries in the left segment, not substrings inside values.
+
+   4.2.7. Boolean flags do not consume a following token; any token that looks like a bare value immediately after a flag in the linear scan is therefore interpreted as starting a new option or as an unexpected bare token, depending on form.
 
    4.3. **Value domain**
 
-   4.3.1. Parsed values classify into three shapes: a boolean flag (presence means true), a single string, or an ordered list of strings. Multi-value mode is only available when the schema marks an option as repeatable; turning that on forces value-taking behavior because at least one value is required in practice.
+   4.3.1. Parsed values classify into three shapes: a boolean flag (presence means true), a single string, or an ordered list of strings. Multi-value mode is only available when the schema marks an option as repeatable; turning that on forces value-taking behavior because accumulation requires per-occurrence values.
 
    4.3.2. Defaults are represented as pre-seeded single string values; when serving callers, user-provided values override defaults. Flags do not use defaults in the same way—presence is explicit.
 
+   4.3.3. Querying a value merges user value with default for value-taking options; flags are detected by stored value kind. A flag is considered present only when the stored value is the flag kind, not when a default might exist for other kinds.
+
    4.4. **Query API on parsed state**
 
-   4.4.1. Callers retrieve a single string, test flag presence, or obtain a shared slice of multiple strings by stable option name. Internally, resolution merges user value with default for value-taking options; flags are detected by discriminant.
+   4.4.1. Callers retrieve a single string, test flag presence, or obtain a shared slice of multiple strings by stable option name. Internally, resolution merges user value with default for value-taking options; flags are detected by stored value kind.
 
-   4.4.2. Extra arguments after `--` are exposed as a cloned vector so embedders can forward them without aliasing the parser’s internal storage.
+   4.4.2. Extra arguments after the end-of-options marker are exposed as a cloned vector so embedders can forward them without aliasing the parser’s internal storage.
 
    4.5. **Help generation**
 
    4.5.1. Help text is assembled by partitioning the schema into required vs. optional entries, then rendering each partition with aligned columns: the longest formatted name sets the column width so descriptions line up.
 
-   4.5.2. Each option formats as a indented long name, with `<name>` placeholders for value-taking options. Descriptions append after a fixed triple-space gap; if both help prose and a default exist, the prose appears first followed by a bracketed default annotation; if only default exists, the bracketed default stands alone.
+   4.5.2. Each option formats as an indented long name, with angle-bracket placeholders repeating the logical name for value-taking options. Descriptions append after a fixed triple-space gap; if both help prose and a default exist, the prose appears first followed by a bracketed default annotation; if only default exists, the bracketed default stands alone.
 
-   4.6. **Error taxonomy**
+   4.6. **Error taxonomy and message semantics**
 
-   4.6.1. Errors distinguish: unknown or misplaced tokens, missing required options, missing values for value-taking options, duplicates where disallowed, and forbidden pairwise combinations. Messages are stable, sentence-style strings suitable for CLI output.
+   4.6.1. **Forbidden combination** — Triggered when an option that forbids others was seen with a user value, and a forbidden option’s token appears in the left segment. The message names the two participants; ordering in the template reflects internal argument order, not command-line order.
 
-   4.7. **Limitations implied by the design**
+   4.6.2. **Missing required option** — Either a schema-required option never received a user value, or an option with a co-requisite appeared but the co-requisite’s token was absent from the left segment. The same variant covers both “globally required” and “required because something else appeared.”
 
-   4.7.1. Co-requirement checks look for literal `--name` substrings in the token list; options must be declared in a consistent naming scheme for that check to match.
+   4.6.3. **Missing value** — A value-taking option was recognized but the next token was missing or began with the long-option prefix.
 
-   4.7.2. Short options are not generalized—only the help alias is special-cased; all other single-dash tokens are unexpected unless they appear after `--` in the extra-args bucket.
+   4.6.4. **Unexpected token** — A token did not begin with the long-option prefix on the left segment, or the name after the prefix was unknown, or an internal inconsistency occurred while merging repeatable values.
 
-   4.7.3. Ordering of duplicate multi-value accumulation follows argv order; the parser does not sort or deduplicate unless duplicate appearance itself is illegal.
+   4.6.5. **Duplicate** — The same option appeared twice when repetition was not allowed.
 
-5. **Cross-cutting engineering properties**
+   4.6.6. Messages are stable, sentence-style strings suitable for CLI output; they are suitable for logs but are not themselves machine-parseable codes beyond the typed error variants exposed to callers.
 
-   5.1. **Safety and FFI**
+   4.7. **Combinations and ordering caveats**
 
-   5.1.1. Unsafe blocks are limited to well-scoped POSIX calls with documented preconditions (valid pointers to stack-allocated structs, correct clock IDs).
+   4.7.1. Co-requirement checks require an exact token matching the conventional long form built from the related name; options must be declared with names consistent with that equality test.
 
-   5.2. **Dependencies**
+   4.7.2. Short options are not generalized—only the help alias is special-cased; all other single-dash tokens on the left segment are unexpected unless they appear after the end-of-options marker in the extra-args bucket.
 
-   5.2.1. Error handling uses a derive-based error crate and displaydoc for human-readable messages; the C library is accessed through the libc crate for clocks and local time.
+   4.7.3. Ordering of duplicate multi-value accumulation follows command-line order; the parser does not sort or deduplicate unless duplicate appearance itself is illegal.
 
-   5.3. **Evolution**
+   4.7.4. A trailing end-of-options marker with nothing after it yields an empty forward list; a missing value for a value-taking option remains an error even if the next token would have been the separator, because the separator is consumed only during the initial split, not during per-option value consumption.
 
-   5.3.1. New validation rules should extend the small validator enum rather than ad-hoc boolean APIs; new CLI behaviors should extend the schema model (defaulting, repetition, forbids/requires) to keep the relational validation in one place.
+5. **Security and trust considerations**
+
+   5.1. **Argument handling**
+
+   5.1.1. Parsing operates on a vector of strings already split by the runtime; it does not invoke a shell and does not perform glob expansion or variable interpolation. Risk from metacharacters is therefore delegated to whatever program constructs the argument vector (parent process, service manager, or remote API), not to this layer.
+
+   5.1.2. Extra arguments are forwarded verbatim; embedders that pass those strings to guests or subprocesses inherit responsibility for quoting, capability boundaries, and injection into other languages’ contexts.
+
+   5.1.3. Relational checks use equality of whole argument entries for forbidden and required companion tokens, which avoids naive substring spoofing on a single token but also means the policy is sensitive to exact spelling and duplicate-dash forms as emitted—callers should treat the left segment as structured data, not as free text.
+
+   5.2. **Identifier validation**
+
+   5.2.1. The validator reduces risk of pathological or confusing identifiers in cross-component protocols by bounding length and excluding most punctuation. It is not a full Unicode normalization or confusable-character audit; visually similar identifiers or homoglyphs are out of scope.
+
+   5.2.2. Because alphanumeric classification is Unicode-aware, internationalized labels are accepted when they satisfy length and character rules; security policies that require ASCII-only labels need an additional check upstream or downstream.
+
+   5.3. **Time and FFI**
+
+   5.3.1. Wall-clock and CPU-time reads use small unsafe blocks around POSIX calls with stack-allocated structures and fixed clock identifiers; the high-resolution x86 path uses an intrinsic read of the cycle counter. Trust is placed in the kernel and CPU for sane return values; the nanosecond aggregation path assumes conversions succeed for realistic clock readings.
+
+   5.3.2. Local time formatting inherits the platform C library’s notion of time zone and DST; incorrect or malicious zone configuration affects displayed civil time but not the monotonic measurement APIs.
+
+6. **Cross-cutting engineering properties**
+
+   6.1. **Safety and FFI**
+
+   6.1.1. Unsafe blocks are limited to well-scoped POSIX calls with documented preconditions (valid pointers to stack-allocated structs, correct clock IDs) and architecture intrinsics where applicable.
+
+   6.2. **Dependencies**
+
+   6.2.1. Error handling uses conventional attribute-driven error typing for human-readable messages; the C library is accessed through the platform FFI bindings for clocks and local time.
+
+   6.3. **Evolution**
+
+   6.3.1. New validation rules should extend the small validator error taxonomy rather than ad-hoc boolean APIs; new CLI behaviors should extend the schema model (defaulting, repetition, forbids/requires) to keep the relational validation in one place.
