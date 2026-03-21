@@ -46,6 +46,16 @@
 
    2.6.1. Unit tests assert monotonicity (or at least non-decreasing behavior) for repeated reads of monotonic and CPU clocks, sanity on realtime nonzero values, consistency between nanosecond, microsecond, and millisecond derivations, display formatting for hand-crafted civil times, and overflow behavior on extreme second-to-nanosecond conversion.
 
+   2.7. **Behavioral contract and observable quirks**
+
+   2.7.1. The nanosecond read is the canonical sample: microsecond and millisecond views are pure views over that total, so a caller who records nanoseconds and later derives milliseconds will see the same truncation relationship the library uses internally—there is no hidden rounding mode or floating-point path.
+
+   2.7.2. Monotonic time is the appropriate default for elapsed-interval and ordering questions; realtime is appropriate when the question is “what civil instant is it” or when correlating with external wall-clock timestamps. CPU-time clocks answer “how much execution resource was consumed,” which can diverge sharply from wall time under load or when blocked.
+
+   2.7.3. The dedicated second-to-nanosecond conversion is the only place overflow is surfaced as a recoverable outcome; the main readers assume success and will abort the process if aggregation encounters a representation failure. That split matters for embedders who wrap or fuzz time APIs: tests may exercise the conversion helper’s edge cases without expecting the same outcomes from the fast clock readers unless the kernel could actually return such magnitudes.
+
+   2.7.4. Local-time display is not timezone-stable across calls: two successive reads can straddle a zone transition and produce non-monotonic or surprising civil fields even while monotonic nanoseconds advance smoothly—callers mixing the two kinds of output should not assume one implies the other.
+
 3. **Identifier validation**
 
    3.1. **Policy**
@@ -69,6 +79,16 @@
    3.3.1. Validation is O(n) over Unicode scalar values with early exit on the first disallowed character; length is checked before scanning so overlong strings fail without a full pass when length alone violates policy.
 
    3.3.2. Because validation accepts only well-formed UTF-8 text at the boundary, ill-formed encodings cannot appear as input; callers supply valid Unicode sequences.
+
+   3.4. **Edge cases and policy mismatches**
+
+   3.4.1. A single-byte string that is one printable ASCII character passes both length and character rules; the minimum length bound is therefore one byte, not one grapheme, so a lone combining mark encoded in multiple bytes could satisfy length while still being an odd standalone label depending on higher-level policy.
+
+   3.4.2. The reported position for invalid characters is the zero-based index in the scalar iteration, not the byte offset in the UTF-8 encoding. Diagnostics that show both the character and the index are therefore aligned with “which logical character failed,” not “at which byte offset,” which matters when correlating errors with hex dumps or network frames.
+
+   3.4.3. Characters that normalize to different byte sequences in different Unicode normalization forms are not canonicalized here; two visually identical labels might compare unequal upstream while both passing this validator, or vice versa, depending on how peers perform equality.
+
+   3.4.4. Underscores are rejected even though some naming conventions treat them as word separators; only hyphen is admitted among non-alphanumeric punctuation, so migration from underscore-heavy identifiers requires translation or a different validator.
 
 4. **Command-line parsing architecture**
 
@@ -129,6 +149,8 @@
 
    4.3.3. Querying a value merges user value with default for value-taking options; flags are detected by stored value kind. A flag is considered present only when the stored value is the flag kind, not when a default might exist for other kinds.
 
+   4.3.4. A schema-marked required option is satisfied only when the user actually supplied a value or flag on the command line; pre-seeded defaults do not count toward that requirement during validation, even though lookups can still resolve to the default when the option is optional. Practically, combining “required” with “default” forces the user to repeat an explicit assignment if the schema author intended the default to be a documentation hint only.
+
    4.4. **Query API on parsed state**
 
    4.4.1. Callers retrieve a single string, test flag presence, or obtain a shared slice of multiple strings by stable option name. Internally, resolution merges user value with default for value-taking options; flags are detected by stored value kind.
@@ -165,6 +187,20 @@
 
    4.7.4. A trailing end-of-options marker with nothing after it yields an empty forward list; a missing value for a value-taking option remains an error even if the next token would have been the separator, because the separator is consumed only during the initial split, not during per-option value consumption.
 
+   4.8. **Further interaction scenarios**
+
+   4.8.1. If the first token after the program name is the end-of-options sentinel, the left segment is empty: no long options are parsed, required-option validation fails if the schema demands any, and the entire remainder (if any) becomes forwarded material—useful only when the embedding application intends “all guest args, no host flags.”
+
+   4.8.2. Multiple end-of-options tokens can appear only if the first one is not followed immediately by another in the left segment; after the split, every token in the forwarded tail is opaque, including additional double-dash tokens, so a guest may pass its own long-looking tokens without the host parser interpreting them.
+
+   4.8.3. Help and version preempt validation of required options: a minimal invocation that only requests help succeeds even when mandatory host options were declared in the schema, because the early exit records only the synthetic help or version state.
+
+   4.8.4. A value-taking option whose value is intended to be a literal string beginning with the long-option prefix cannot express that on the left segment under the current rules—the next token would be rejected as a missing value. Such values must be placed after the end-of-options marker in the forwarded tail or carried through a different configuration channel.
+
+   4.8.5. Repeatable value-taking options accumulate in encounter order; interleaving with other options preserves a total order over the collected list that mirrors argv order, which matters when order encodes precedence (for example layered configuration).
+
+   4.8.6. Relational checks (co-requisites and mutual exclusions) consider only arguments that successfully bound a user value in the first pass, including boolean flags. Options that never completed parsing—because of unknown names, missing values, or duplicates where disallowed—do not participate in that second pass, so ordering of errors can surface structural problems before relational ones.
+
 5. **Security and trust considerations**
 
    5.1. **Argument handling**
@@ -186,6 +222,14 @@
    5.3.1. Wall-clock and CPU-time reads use small unsafe blocks around POSIX calls with stack-allocated structures and fixed clock identifiers; the high-resolution x86 path uses an intrinsic read of the cycle counter. Trust is placed in the kernel and CPU for sane return values; the nanosecond aggregation path assumes conversions succeed for realistic clock readings.
 
    5.3.2. Local time formatting inherits the platform C library’s notion of time zone and DST; incorrect or malicious zone configuration affects displayed civil time but not the monotonic measurement APIs.
+
+   5.4. **Resource use and sensitive data**
+
+   5.4.1. Parsing is linear in the number of tokens on the left segment and linear in the length of strings stored; there is no deliberate quadratic behavior, but extremely large argv vectors produced by a hostile parent could still stress memory. Embeddings that accept remote configuration should cap argument count and length outside this crate.
+
+   5.4.2. Error messages and help text may echo option names and values supplied by the user; logs that include parse errors should be treated as potentially containing secrets (tokens, paths) unless redacted upstream.
+
+   5.4.3. Forwarded arguments are copied into an owned buffer for the embedder; that duplication is a deliberate isolation choice so later mutation of the parser’s internal state cannot silently change what will be passed along, at the cost of extra allocations proportional to forwarded token count and length.
 
 6. **Cross-cutting engineering properties**
 
