@@ -185,6 +185,6 @@
 
 ## 13. Further reading
 
-13.1. The reusable Python framework that implements microVM construction, API clients, artifacts, and A/B helpers is documented in its own README for deeper implementation detail.
+13.1. The reusable Python framework that implements microVM construction, API clients, artifacts, and A/B helpers is documented in a dedicated companion note under that tree for deeper implementation detail.
 
 13.2. Operational commands (container entrypoints, developer scripts, artifact downloads) live at the repository tooling layer and intentionally stay out of this architecture note.
