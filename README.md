@@ -18,6 +18,8 @@ The sections below are a **systems architecture** view of this repository and po
 
 1.3. **Threat stance.** Untrusted code is assumed to run inside the guest. vCPU threads are treated as hostile once the guest runs. Data leaving the guest toward the host (network frames, block I/O, vsock bytes) crosses **trust boundaries** where copying, policy, and rate limiting apply. Seccomp **BPF** filters constrain which host syscalls each thread may invoke, tightened further after initialization so the attack surface shrinks over the lifecycle. The model assumes a compromised guest may attempt to abuse MMIO, malformed virtio rings, or timing; device code is written to fail closed or terminate rather than loop on inconsistent guest state.
 
+1.4. **Positioning vs general hypervisors.** Firecracker targets **single-tenant, short-lived** workloads where boot time, memory footprint, and syscall exposure matter more than emulating arbitrary PC hardware. There is no USB stack, no broad graphics surface, and no plug-in device model; that omission is a product decision that simplifies testing, formalizes the API contract, and keeps the codebase small enough to reason about under adversarial guest assumptions.
+
 ---
 
 ## 2. Structural decomposition
@@ -45,13 +47,13 @@ The sections below are a **systems architecture** view of this repository and po
                     +------------------+
 ```
 
-1. The **API thread** serves JSON-over-HTTP requests and never executes guest instructions.
+1. The **API thread** serves JSON-over-HTTP requests and never executes guest instructions. Serialization and schema validation dominate CPU here; throughput is rarely the bottleneck for microVM orchestration, but latency spikes on this thread still delay operator-visible actions such as pause or snapshot requests.
 
-2. The **VMM thread** runs an event-driven reactor tying together KVM fds, virtio queues, timers, and signals.
+2. The **VMM thread** runs an event-driven reactor tying together KVM fds, virtio queues, timers, and signals. It is the natural home for **coalescing** device work: multiple virtio completions can batch before interrupt injection, and timer wheels align with poll readiness rather than busy-waiting in vCPU threads.
 
-3. **vCPU threads** issue `KVM_RUN` in a loop. Exits funnel device work back into the VMM’s world (MMIO, interrupts, virtio kicks).
+3. **vCPU threads** issue `KVM_RUN` in a loop. Exits funnel device work back into the VMM’s world (MMIO, interrupts, virtio kicks). Each thread carries architecture-specific run-state mappings used for immediate exit, debugging, and snapshot save while paused.
 
-4. Additional **worker** or **I/O** paths may serve virtio backends (e.g., tap, files, io_uring) so guest-driven work does not block the central poll loop more than necessary.
+4. Additional **worker** or **I/O** paths may serve virtio backends (e.g., tap, files, io_uring) so guest-driven work does not block the central poll loop more than necessary. Whether work runs inline in the reactor or on helpers is a performance tuning axis, not a semantic change to the guest contract.
 
 2.2. **Crate layering (conceptual).**
 
@@ -131,11 +133,11 @@ The sections below are a **systems architecture** view of this repository and po
 
 ## 5. Memory and CPU presentation
 
-5.1. **Guest RAM.** RAM is mapped for the guest with architecture-specific alignment and dirty tracking for migration/snapshot. Regions may be anonymous, file-backed, or tied to snapshot restore files; registration consumes KVM memory slots until host limits are reached.
+5.1. **Guest RAM.** RAM is mapped for the guest with architecture-specific alignment and dirty tracking for migration/snapshot. Regions may be anonymous, file-backed, or tied to snapshot restore files; registration consumes KVM memory slots until host limits are reached. Multi-region layouts exist to satisfy alignment and huge-page policies; each region must be registered with the hypervisor so guest physical addresses resolve consistently with the host mapping. Slot exhaustion is an operator-visible hard error—there is no transparent spill to slower emulation.
 
-5.2. **CPU templates.** Templates adjust visible CPUID (x86) or device-tree CPU features (ARM) so guests see a stable, supportable feature set across heterogeneous hosts. Custom templates can be synthesized from baseline hardware fingerprints using helper tooling.
+5.2. **CPU templates.** Templates adjust visible CPUID (x86) or device-tree CPU features (ARM) so guests see a stable, supportable feature set across heterogeneous hosts. Custom templates can be synthesized from baseline hardware fingerprints using helper tooling. The goal is **predictable capability**: a guest image built against one host should not suddenly see different instruction-set or timer semantics after migration or restore unless the operator intentionally changes templates.
 
-5.3. **ACPI.** Minimal ACPI artifacts may be generated to satisfy guest kernels’ expectations without turning Firecracker into a full PC emulator.
+5.3. **ACPI.** Minimal ACPI artifacts may be generated to satisfy guest kernels’ expectations without turning Firecracker into a full PC emulator. Tables exist to bridge boot and power-management assumptions kernels make on “PC-like” platforms while keeping the emulated ACPI surface as small as the boot path allows.
 
 5.4. **Userfaultfd (UFFD) and demand paging (conceptual).** Linux **userfaultfd** lets userspace handle page faults on registered memory ranges. In Firecracker’s restore flow, anonymous guest regions can be registered with a UFFD object and handed to a cooperating **page-server** process. When the guest touches a not-yet-resident page, the kernel delivers a fault event to that handler, which can populate the page (for example from a compressed image, remote store, or deduplicated cache) before guest execution resumes. This enables **lazy** or **demand-filled** memory: the guest can start before every page of RAM is present locally.
 
@@ -147,6 +149,8 @@ The sections below are a **systems architecture** view of this repository and po
 
 5.5. **GDB stub (optional).** When built with the GDB feature, the monitor can expose a **remote GDB** interface over a configurable Unix socket. The debugger attaches to the guest’s execution state **from outside** the normal API-driven run loop: vCPU threads participate in stop/cont, register read/write, and breakpoint/single-step flows coordinated with the stub. This path is intended for **development and diagnosis**, not production guest management—it increases trusted computing base and operational surface, so it remains opt-in at compile time and is typically absent from hardened production binaries. Operators should treat debug sockets with the same care as any powerful local control channel.
 
+5.6. **Interaction with pause and snapshots.** Debugging competes with **pause** and **save** semantics: a stopped guest under GDB still occupies KVM and memory resources, and snapshot integrity assumes a quiesced, well-defined device and vCPU state. Production snapshot workflows should not assume a debuggable binary is deployed.
+
 ---
 
 ## 6. Security architecture
@@ -157,23 +161,29 @@ The sections below are a **systems architecture** view of this repository and po
 
 6.3. **Cgroups and quotas.** Beyond the jailer, operators can bind CPU and NUMA affinity via cgroups so noisy neighbors are mitigated and scheduling stays predictable.
 
+6.4. **Defense in depth (conceptual).** No single layer provides safety: **namespaces** reduce what the filesystem and network IDs mean; **cgroups** cap CPU and memory; **seccomp** limits syscalls per thread category; **minimal devices** reduce buggy emulation surface; **validation** rejects incoherent configs before hardware-backed state exists. A vulnerability in one layer may be contained or detected more easily when others still hold.
+
 ---
 
 ## 7. Observability
 
-7.1. **Logging.** Structured logs go to a configured destination with explicit levels; panic hooks attempt to flush metrics and restore terminal state where relevant.
+7.1. **Logging.** Structured logs go to a configured destination with explicit levels; panic hooks attempt to flush metrics and restore terminal state where relevant. Log volume is intentionally bounded by configuration so a chatty guest cannot force unbounded host log growth without operator action.
 
-7.2. **Metrics.** Counters and gauges cover vCPU behavior, devices, API usage, and faults. Periodic emission plus event-driven updates give operators time-series signals without guest cooperation.
+7.2. **Metrics.** Counters and gauges cover vCPU behavior, devices, API usage, and faults. Periodic emission plus event-driven updates give operators time-series signals without guest cooperation. Device-level metrics (drops, rate-limit hits, queue errors) complement aggregate process metrics so operators can distinguish guest-driven abuse from host resource exhaustion.
 
-7.3. **Tracing (optional build).** Instrumentation hooks can compile in for deeper latency analysis when enabled via features.
+7.3. **Tracing (optional build).** Instrumentation hooks can compile in for deeper latency analysis when enabled via features. When disabled, the build stays lean for production; when enabled, traces augment logs and metrics for development without changing guest-visible behavior.
+
+7.4. **Operational signals vs guest introspection.** Observability is **host-centric**: it reflects VMM and KVM health, not arbitrary in-guest stack traces unless optional debug tooling is enabled. That boundary keeps the trust model clear—operators diagnose the sandbox, not replace in-guest monitoring.
 
 ---
 
 ## 8. Testing and validation
 
-8.1. **Rust tests.** Unit and integration tests in the VMM and tools exercise KVM interactions (where the CI environment permits), virtio logic, and serialization.
+8.1. **Rust tests.** Unit and integration tests in the VMM and tools exercise KVM interactions (where the CI environment permits), virtio logic, and serialization. Tests that require KVM or specific kernel features are often gated so developer laptops and minimal CI shards can still run the majority of the suite.
 
-8.2. **Python integration tests.** A host-driven framework boots real microVMs, drives the API, and asserts behavior across kernels and configurations, including performance and regression suites.
+8.2. **Python integration tests.** A host-driven framework boots real microVMs, drives the API, and asserts behavior across kernels and configurations, including performance and regression suites. These tests validate **end-to-end contracts**—API responses, boot, networking, snapshots—complementing Rust tests that focus on components in isolation.
+
+8.3. **Layered confidence.** Unit tests catch logic errors early; integration tests catch wiring and syscall-level behavior; Python tests catch operator workflows. Failures at higher layers often indicate missing lower-layer coverage rather than flaky guests alone.
 
 ---
 
