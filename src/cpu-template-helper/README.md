@@ -2,137 +2,185 @@
 
 1. **Purpose and operational model**
 
-   1.1. The helper is a standalone command-line tool that supports authoring, deduplicating, validating, and fingerprinting *custom CPU templates* for a microVM stack. It reuses the same CPU configuration types and VMM construction logic as the main hypervisor, so what it dumps, strips, or verifies is semantically aligned with what the VMM would apply at boot—not an independent approximation.
+   1.1. A standalone command-line companion for authoring, deduplicating, validating, and fingerprinting *custom CPU templates* used with a Firecracker-style microVM stack. It reuses the same CPU configuration types and the same boot-time monitor construction path as the main hypervisor, so exported JSON reflects what the VMM would actually apply—not a parallel model.
 
-   1.2. Work is organized into two command families: *template* operations (dump the effective guest CPU configuration as template-shaped data, strip redundancy across multiple template documents, verify that a template’s intent matches the configuration the VMM actually materialized) and *fingerprint* operations (capture host plus guest-CPU state into a single JSON artifact, and compare two such artifacts with selectable fields).
+   1.2. Commands fall into two families: *template* (dump effective guest CPU state as template-shaped JSON, strip redundancy across several template documents, verify that a template’s assertions hold against a live export) and *fingerprint* (record host context plus the same guest CPU snapshot in one JSON artifact, then compare two artifacts with per-field filters).
 
-   1.3. On success the process exits with a zero status; failures print a human-readable error to standard error and exit non-zero. Output artifacts are pretty-printed JSON for review and diffing in version control or CI.
+   1.3. Success exits zero; failures write a concise message to standard error and exit non-zero. Outputs are pretty-printed JSON for review, diffing, and CI gates.
 
-2. **Relationship to the VMM and the “microVM build”**
+2. **Guest construction: how every “live” pipeline is anchored**
 
-   2.1. Nearly every substantive operation begins by constructing a virtual machine monitor instance and associated machine resource bundle from a Firecracker-style JSON configuration, optionally augmented with a deserialized custom CPU template. The construction path is the same *boot-oriented* builder used elsewhere: an event loop handle is created, seccomp filters are explicitly set to an empty set (the tool is not a long-running sandboxed service), and the microVM is prepared *without* requiring a full guest workload—only enough structure exists for CPU state to be introspected.
+   2.1. Dump, verify, and fingerprint dump all need a constructed monitor so the stack can call into the same export hook the product uses. Construction begins by turning a JSON machine description into resource bundles, optionally overlaying a deserialized custom CPU template so the effective template is “what the config says” plus any explicit template file passed on the command line.
 
-   2.2. When the operator does not supply a configuration path, the tool synthesizes a minimal valid configuration: a tiny kernel image is materialized from bytes embedded at build time, paired with an empty block device acting as root, and referenced from generated JSON. On one architecture the embedded kernel is a statically linked, minimal stub that spins forever; on another it is a header-sized blob satisfying the platform’s expected boot image layout. This keeps template and fingerprint workflows usable in CI or developer machines without mandating real guest images.
+   2.2. When no configuration text is supplied, the tool synthesizes a minimal valid description: a tiny kernel image is materialized from bytes embedded at build time, paired with an empty block device as root, and referenced from generated JSON. On 64-bit x86 the embedded image is a statically linked stub produced by compiling a minimal C program with a freestanding link (no standard libraries, no unwind tables, symbols stripped) so the blob is small and deterministic. On 64-bit AArch64 the embedded artifact is not a runnable loop but a correctly formed boot image header matching the platform’s documented layout (magic and reserved fields) so the loader accepts it; only the header bytes are required for the helper’s purposes.
 
-   2.3. When a configuration *is* supplied, it is read as text and parsed through the same resource loader as production, including payload size limits carried over from the HTTP API defaults. An optional template path is merged into machine resources so the effective template is whatever the configuration implies, optionally overridden by the explicit template file.
+   2.3. When configuration text *is* supplied, it is parsed with the same resource loader and the same maximum payload size bound as the HTTP-facing API, so pathological inputs are rejected consistently with production.
 
-   2.4. The tool’s own version string is threaded into instance metadata as the VMM version and application name, so diagnostics and fingerprints can be tied to the helper build.
+   2.4. Instance metadata is filled with the helper’s package version as both the reported VMM version and application name, and an anonymous instance identifier. An event loop handle is created, seccomp is explicitly set to empty filters (the tool is a short-lived utility, not a sandboxed long-running service), and the boot-oriented builder runs to obtain a locked monitor handle and the resolved machine resources.
 
-3. **Template dump: from live CPU state to template-shaped JSON**
+   2.5. Nothing in this path requires a meaningful guest workload: only enough of the machine exists for CPU state to be queried. That is why CI and laptops can run dump/verify/fingerprint without real kernels or disk images when the default synthesized config is used.
 
-   3.1. The dump path locks the constructed monitor, asks it to export the current CPU configuration for all vCPUs, and takes the first CPU’s snapshot as representative. That snapshot is an architecture-specific CPU configuration snapshot: on Intel/AMD-style hosts it comprises a normalized CPUID table and a map of MSR index to 64-bit value; on AArch64 hosts it comprises the guest register vector exposed by KVM for the vCPU.
+3. **Template dump pipeline**
 
-   3.2. The conversion into the JSON template schema is intentionally mechanical: every exported leaf/subleaf/register or MSR index becomes a modifier entry whose “value and mask” semantics match the template format (bitmaps describe which bits are relevant and what values they should take after masking).
+   3.1. The monitor is locked and asked to export CPU configuration for all virtual CPUs. The helper then selects the *first* exported snapshot as representative. That choice matches the common case (homogeneous vCPUs) and keeps output stable and small.
 
-   3.3. **x86_64-specific shaping.** CPUID entries are emitted as one leaf modifier per `(leaf, subleaf, flags)` group, with up to four register modifiers inside (EAX/EBX/ECX/EDX), preserving KVM’s per-leaf flags. The MSR list is filtered before serialization: ranges associated with time-varying counters, machine-check and PMU-related MSRs that the VMM does not meaningfully expose, and other high-churn or unsupported values are dropped so dumps focus on stable, comparable state. On AMD hosts an additional exclusion applies to an architecture-capability MSR that KVM emulates on Intel-class systems but which the product stack deliberately hides on AMD via CPUID policy—dumping it would add noise. Remaining MSRs are sorted by index for deterministic output.
+   3.2. The raw snapshot is architecture-specific. On x86 it pairs a normalized CPUID table with a sorted map of model-specific register indices to 64-bit values. On AArch64 it is the guest register vector exposed through KVM for the vCPU.
 
-   3.4. **AArch64-specific shaping.** Registers are converted according to their encoded width (32, 64, or 128 bits); wider encodings are skipped with a warning because the template format does not model them. Timer-related system registers and the program counter are excluded: the former fluctuate with time, the latter is determined by the loaded kernel image rather than a portable “CPU model” concern. The remainder are sorted by register id.
+   3.3. Conversion to the JSON template schema is mechanical: each logical unit in the snapshot becomes a modifier entry. Modifiers always pair a value with a bitmask (“filter”): comparisons and verification apply `(value & mask)` on both sides, so templates can assert only the bits they care about.
 
-4. **Template strip: factoring out what templates agree on**
+   3.4. **x86 shaping.** Each CPUID leaf in the normalized table becomes one leaf object carrying leaf number, subleaf, KVM leaf flags, and up to four register modifiers (the four 32-bit result registers). Leaf iteration order follows the underlying map; after flattening for algorithms, round-tripping sorts by leaf, subleaf, then register name for deterministic JSON.
 
-   4.1. Strip takes *two or more* template documents and produces one output per input. The goal is to remove modifiers (or portions of modifiers) that are identical across *all* inputs, leaving only what differentiates each file—useful when several CPU models share a large common baseline and only a small delta should be maintained per variant.
+   3.5. **x86 MSR filtering.** Before serialization, MSRs are filtered to drop ranges that are time-varying (timestamp and deadline counters), machine-check and PMU-related ranges that the product stack does not meaningfully expose, PEBS and related sampling support that Firecracker does not enable, and AMD performance-counter MSRs in analogous ranges. The goal is to keep dumps stable across runs and comparable across software versions without chasing KVM default churn for features the guest cannot use. On AMD hosts, one additional architectural-capability MSR is removed from dumps because the product hides it via CPUID policy even though KVM may emulate it on Intel-class systems—emitting it would add platform noise. Remaining MSRs are sorted by index.
 
-   4.2. Internally each template is normalized into one hash map per modifier family (on x86, separate maps for CPUID register bits and for MSRs; on AArch64, a single map for guest registers). Keys are fully qualified identities (for CPUID: leaf, subleaf, KVM flags, and which register within the leaf; for MSRs and AArch64 registers: the numeric index/id). Values are *register value filters*: a value plus a bitmask indicating which bits participate.
+   3.6. **AArch64 shaping.** Each exported register is classified by width. Widths of 32, 64, or 128 bits become modifiers with values widened into a fixed unsigned representation; wider KVM encodings are skipped with a warning because the template format does not represent them. Timer-related system registers and the program counter are excluded: timers drift with time, and the PC is determined by the loaded kernel image rather than a portable CPU model. The remaining modifiers sort by register id.
 
-   4.3. The core algorithm walks the key set of the first map as a candidate “common” set. For each key present in the first map, every other map must also contain that key; if any map lacks it, the key is dropped from consideration entirely—partial overlap does not count as “common.” For surviving keys, the algorithm compares the *masked* values across maps (value AND mask). Bits that differ anywhere are accumulated into a difference mask. After this pass, the “common” map holds, for each key, the aggregate XOR of all pairwise masked differences.
+4. **Template strip pipeline**
 
-   4.4. The second phase subtracts that common information from every input map. Where the common difference mask is zero for a key, the filtered values were identical across all inputs, so that key is removed from every map. Where the mask is nonzero, each map keeps the key but narrows each modifier’s filter to the intersection of its previous filter and the common difference mask—so only bits that actually vary across templates remain targeted. Intuitively: shared bits are stripped; disputed bits stay.
+   4.1. Strip accepts *two or more* template documents and emits one output per input. The goal is to delete modifiers—or narrow bit masks—where every input agrees, leaving only per-file deltas. Typical uses include maintaining several CPU model variants that share a large common baseline.
 
-   4.5. The maps are converted back to the template vector representation with deterministic ordering (sorted leaves, sorted registers within a leaf, sorted MSR indices, sorted AArch64 register ids).
+   4.2. **Normalization.** Each document is converted into one hash map per modifier family. On x86 there are two families: CPUID register bits (keys include leaf, subleaf, KVM flags, and which of the four result registers) and MSRs (keys are numeric indices). On AArch64 there is a single family keyed by the numeric register id. Values are always register value filters (value plus mask).
 
-5. **Template verify: does the template match reality?**
+   4.3. **Core algorithm (architecture-agnostic).** The implementation seeds a working “reference” map from the *first* input. For each key present in that first map, every other map must contain the same key; if any map lacks it, the key is discarded from the reference entirely—partial overlap does not count as common. For surviving keys, the algorithm accumulates a per-bit difference mask by comparing every other map’s *masked* value to the first map’s *masked* value at that key, combining those XORs with bitwise OR so any bit that differs from the first map in any input is marked.
 
-   5.1. Verify combines three inputs in memory: the machine configuration (to recover which custom template the operator believes should apply), the explicit template file if provided (merged earlier), and a fresh dump of the effective guest CPU configuration using the same conversion as the dump command.
+   4.4. **Subtraction phase.** For each key still in the reference, if the difference mask is zero, the masked values matched the first map across all inputs, so the key is removed from *every* input map. If the mask is nonzero, each input keeps the key but replaces its filter with the bitwise AND of its previous filter and the difference mask—only bits that actually varied (relative to the first file, and among files that had the key) remain targeted.
 
-   5.2. The check is *template-driven*: every modifier that exists in the template must have a corresponding entry in the dumped configuration, and for each such entry the masked template value must equal the masked configuration value under the template’s mask. Extra state present in the dump but not covered by the template is not a failure—the template may intentionally specify only a subset of bits or leaves.
+   4.5. **Ordering.** Maps convert back to the nested vector form with deterministic sorting: x86 CPUID leaves sorted by leaf and subleaf, registers within a leaf sorted by name; MSRs and AArch64 registers sorted by id.
 
-   5.3. The equality test uses the same hash-map representation as strip, so CPUID is compared per `(leaf, subleaf, flags, register)` tuple and MSRs or AArch64 registers per numeric id. Mismatches produce errors that include a bit-aligned ASCII visualization: three lines showing the template bits, the configuration bits, and a row of carets marking differing bit positions—making off-by-one bitmask authoring mistakes obvious.
+   4.6. **Interaction with verify and fingerprint compare.** The same strip routine is reused when fingerprint compare needs a human-sized diff for guest CPU configuration: two full templates that differ are both normalized and stripped as a pair so the report shows minimized differing bits rather than two complete documents.
 
-6. **Fingerprint dump: anchoring templates to host context**
+5. **Template verify pipeline**
 
-   6.1. A fingerprint extends the guest CPU template snapshot with host metadata so operators can tell whether a template was produced on a comparable software and firmware stack. Fields include: the helper’s version (as a stand-in for the tool lineage), the running kernel release from `uname`, a microcode or CPU revision string read from sysfs (the exact sysfs node depends on architecture—one path exposes x86 microcode version, another exposes AArch64 REVIDR), and DMI-derived BIOS version and BIOS release strings read from the virtual sysfs tree for firmware identification.
+   5.1. Verify builds a monitor from configuration plus optional explicit template file, then resolves “the template under test” from machine resources—the same object dump uses when merging config and CLI overrides. In parallel it runs the dump pipeline to obtain the *effective* guest CPU configuration after everything the VMM applied.
 
-   6.2. Trailing newlines from sysfs reads are stripped for stable string equality. Guest CPU configuration inside the fingerprint is populated by the same dump pipeline as template dump, so the JSON nested under the host metadata is template-shaped and comparable to stripped template outputs.
+   5.2. The check is **template-driven**: for every modifier in the template, there must be a matching key in the exported configuration map, and the template’s masked expectation must equal the configuration’s masked value under the template’s mask. Extra leaves, MSRs, or registers present in the export but not listed in the template are **not** failures; templates may deliberately specify only a subset.
 
-7. **Fingerprint compare: diffing two snapshots with filters**
+   5.3. **Per-architecture maps.** On x86, CPUID and MSR families are verified separately with the same flattened keys as strip. On AArch64, a single register map is verified.
 
-   7.1. Compare loads two JSON fingerprints, deserializes them into a strongly typed structure, and evaluates a caller-selected list of top-level fields (defaulting to *all* fields). For scalar host metadata fields the comparison is strict string inequality.
+   5.4. **Mismatch diagnostics.** When a key is missing, the error names the key in the same human-readable form strip uses (leaf/subleaf/flags/register on x86, numeric id on AArch64). When values disagree, the error includes a three-line bit-oriented display: binary for the template side, binary for the configuration side, and a row of carets under bit positions that differ—MSB to LSB—so off-by-one mask mistakes are obvious.
 
-   7.2. For the embedded guest CPU configuration field, a naive inequality would be noisy when many bits are equal. If that field differs, the helper clones both guest configurations into a two-element list and runs the *same strip algorithm* used for multi-file template maintenance. Strip with two inputs removes identical masked values and leaves only differing bits per modifier. The resulting pair is what gets serialized into the diff report, so the operator sees a minimized delta rather than two full templates.
+6. **Fingerprint dump pipeline**
 
-   7.3. If any compared field differs, the command fails and concatenates pretty-printed JSON diff objects (each records the field name, previous value, current value). If all selected fields match, it succeeds with no output.
+   6.1. Fingerprint dump reuses the full template dump to populate the guest CPU section, so nested JSON matches template dump output for the same machine state.
 
-8. **Cross-cutting design: modifier maps, bitmaps, and display**
+   6.2. Host metadata is collected alongside: the helper’s package version (standing in for tool lineage), the running kernel release from the standard system call that fills a `utsname` structure, a CPU revision string from sysfs (x86 reads the per-logical-cpu microcode version node under the CPU device tree; AArch64 reads the CPU identification revision register exposed in sysfs), and DMI-derived firmware strings for BIOS version and BIOS release from the virtual DMI sysfs tree. Trailing newlines are stripped from sysfs reads so string equality is stable.
 
-   8.1. Throughout, CPUID on x86 is treated as a flat map keyed by the full qualifier (leaf, subleaf, flags, register) because the hypervisor’s leaf structures group registers together; flattening enables uniform algorithms. MSRs and AArch64 registers use a single numeric key with an opaque id formatting for error messages.
+   6.3. **Failure modes.** If sysfs nodes are unreadable in a given environment, dump may fail with the underlying I/O error; kernel version retrieval fails if the system call errors. This is intentional: partial fingerprints would silently omit host context.
 
-   8.2. Modifier entries pair a value with a bitmask (“filter”) in a consistent way: comparisons always apply bitwise AND of value and mask on both sides, so partial-bit templates only assert the bits they care about.
+7. **Fingerprint compare: semantics and filters**
 
-   8.3. A small trait layer abstracts how numeric types render bit-diff strings for error messages, walking bit positions from most to least significant and emitting spaces where bits match and carets where they differ.
+   7.1. Compare loads two JSON documents into a strongly typed structure. The caller supplies one or more *field selectors*; default behavior selects every top-level field.
 
-9. **Build-time concerns**
+   7.2. **Scalar fields** (tool version, kernel string, microcode/revision string, both firmware strings) use strict string equality. Any inequality for a selected field produces one JSON object recording the field label, previous value, and current value. Multiple differences concatenate into the error text.
 
-   9.1. A build script regenerates the embedded mock kernel artifact whenever the tiny C source changes (on the architecture that compiles it), linking statically without unwind tables and stripping symbols for a minimal binary. On the other architecture it writes only the required boot header bytes. The build marks the output for rerun when inputs change so incremental builds stay correct.
+   7.3. **Guest CPU configuration field.** The embedded template is compared as structured data first. If the two deserialized snapshots are deeply equal, no diff object is emitted for that field. If they differ, the pair is passed through the strip pipeline (exactly two inputs, so strip always succeeds) and the diff object’s “previous” and “current” values are the *stripped* templates, minimizing noise to differing bits and keys.
 
-10. **Testing strategy**
+   7.4. **Exit status.** If every selected field matches, compare succeeds with no standard output. If any selected field differs, compare fails and prints the concatenated pretty-printed diff objects.
 
-    10.1. Unit tests cover the strip core on synthetic small maps, verify behavior for missing keys and mismatched bits, architecture-specific conversion from synthetic CPU configurations, fingerprint sysfs helpers where feasible, and CLI-level smoke tests that exercise dump/strip/verify/fingerprint commands with temporary files.
+   7.5. **Filter ergonomics.** Selecting only host fields ignores guest CPU differences; selecting only guest CPU ignores host drift. This supports workflows like “same firmware and kernel, did the guest CPU view change?” versus “did our BIOS update without touching CPU?”
 
-11. **Architecture overview diagram**
+8. **x86 versus AArch64: structural differences**
 
-```
-                    +-------------------+
-                    | CLI (template /   |
-                    | fingerprint cmds) |
-                    +---------+---------+
-                              |
-                              v
-                    +-------------------+
-                    | Load JSON config  |
-                    | + optional        |
-                    |   template JSON   |
-                    +---------+---------+
-                              |
-                              v
-                    +-------------------+
-                    | Build monitor +   |
-                    | machine resources |
-                    | (empty seccomp)   |
-                    +---------+---------+
-                              |
-          +-------------------+-------------------+
-          |                                       |
-          v                                       v
- +----------------+                    +----------------------+
- | export CPU     |                    | fingerprint extras   |
- | config -> tmpl |                    | (uname, sysfs, DMI)  |
- |   conversion   |                    +----------+-----------+
- +--------+-------+                               |
-          |                                       v
-          |                              +--------------------+
-          |                              | merge into         |
-          |                              | fingerprint JSON   |
-          |                              +--------------------+
-          v
- +------------------+
- | strip / verify / |
- | compare paths    |
- +------------------+
-```
+   8.1. **Modifier families.** x86 templates expose CPUID and MSR modifier lists; AArch64 exposes a single register modifier list keyed by KVM’s 64-bit register ids. Strip and verify run one or two map passes accordingly; fingerprint compare’s guest section always feeds the same strip implementation compiled for the host architecture.
 
-12. **Data-flow diagram (template verify)**
+   8.2. **Key richness.** x86 CPUID keys are four-dimensional (leaf, subleaf, flags, register slot), reflecting how KVM carries per-leaf metadata. AArch64 keys are a single opaque id with a uniform 128-bit value width in the template format.
+
+   8.3. **Noise sources addressed.** x86 dumps apply a large MSR exclusion list and a vendor-specific extra exclusion; AArch64 drops timer and PC registers and skips unsupported widths. Both aim at comparable, policy-aligned snapshots rather than raw hardware trivia.
+
+9. **Cross-cutting: value filters and bit display**
+
+   9.1. Throughout dump, strip, verify, and fingerprint guest sections, numeric types implement a small display trait used only for mismatch lines: bits render from most significant to least, with spaces where the two masked values agree and carets where they diverge. The number of bits in the display matches the type’s width (32 for x86 CPUID registers, 64 for MSRs, 128 for AArch64 register modifiers).
+
+10. **End-to-end views**
+
+10.1. **Template operations overview**
 
 ```
-  Firecracker JSON ------> machine resources ------> merged custom template
-        |                                                   |
-        |                                                   |
-        v                                                   v
-   boot-time microVM build -----------------------> export CPU configuration
-                                                        |
-                                                        v
-                                                 template-shaped dump
-                                                        |
-                                                        v
-                    verify: template masked values  ==  dump masked values
-                            (per CPUID / MSR / reg map)
+  +------------------+     optional JSON machine config
+  | CLI: template    |     optional explicit template JSON
+  |   dump|verify    |------------------------------------+
+  +--------+---------+                                    |
+           |                                               v
+           |                          +--------------------+--------------------+
+           |                          | Parse resources, merge template,      |
+           |                          | build monitor (empty seccomp),        |
+           |                          | anonymous instance metadata             |
+           |                          +--------------------+--------------------+
+           |                                               |
+           |                         +---------------------+---------------------+
+           |                         |                     |                     |
+           v                         v                     v                     v
+  +------------------+    +-------------------+   +------------------+   +------------------+
+  | template strip   |    | export vCPU0      |   | load template    |   | (verify only)    |
+  | (no monitor;     |    | CPU config ->     |   | from resources   |   | compare template |
+  |  reads N JSON    |    | template JSON     |   | + dumped config  |   | vs dump maps     |
+  |  files only)     |    +-------------------+   +--------+---------+   +---------+--------+
+  +------------------+             |                        |                        |
+                                   v                        v                        v
+                          write pretty JSON          pretty JSON              stderr on mismatch
 ```
+
+10.2. **Fingerprint operations overview**
+
+```
+  +----------------------+
+  | CLI: fingerprint     |
+  |   dump | compare     |
+  +----------+-----------+
+             |
+     +-------+--------+
+     |                |
+     v                v
++------------+   +------------------+
+| dump path  |   | compare path     |
+| monitor +  |   | read two JSON    |
+| host probe |   | per-field filter |
++------+-----+   +---------+--------+
+       |                   |
+       v                   v
++------------+   +---------------------------+
+| uname +    |   | scalars: string compare   |
+| sysfs DMI  |   | guest: optional strip of  |
+| + guest    |   |   pair if JSON differs    |
+|   dump     |   +---------------------------+
++------------+
+```
+
+10.3. **Verify data flow**
+
+```
+  machine JSON ----------> resources + merged template intent
+        |                          |
+        |                          v
+        +----------------> boot-time monitor build
+                                    |
+                                    v
+                          export CPU configuration
+                                    |
+                                    v
+                          template-shaped "actual"
+                                    |
+                                    v
+               template JSON ------> per-key masked equality
+               (expected)              (template filters applied
+                                        to both sides)
+```
+
+10.4. **Strip conceptual model (three inputs, one key)**
+
+```
+  File A   File B   File C          Reference taken from A.
+  key K    key K    key K           XOR/OR pass marks bits where B or C
+  value a  value a  value a'        differs from A’s masked value at K.
+
+  If all three masked values equal: difference mask = 0 -> key removed everywhere.
+
+  If C differs in some bits: mask nonzero -> each file keeps K but
+  new_mask = old_mask & difference_mask, so shared agreeing bits drop out
+  of the maintained template noise.
+```
+
+11. **Build-time and testing notes**
+
+   11.1. The build script for the mock kernel reruns when the tiny C source changes on x86; on AArch64 it writes the header blob when invoked. Unsupported host architectures fail fast at build time.
+
+   11.2. Automated tests exercise the strip core on synthetic maps, verify error formatting, architecture-specific conversions with crafted inputs, sysfs helpers where the environment allows, and CLI smoke tests that run dump, strip, verify, and fingerprint subcommands against temporary files.
