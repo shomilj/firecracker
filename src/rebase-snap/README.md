@@ -1,83 +1,105 @@
 # Rebase-snap
 
-1. **Purpose and problem domain**
+1. **Purpose**
 
-   1.1. The executable implements a single, narrowly scoped operation: it applies a sparse “diff” view of memory snapshot bytes onto an existing “base” snapshot by overwriting only those byte ranges where the diff actually carries data. In virtualization and checkpointing pipelines, memory snapshots are often stored as sparse files so that unmodified or zero-filled regions do not consume backing storage. A subsequent incremental or layered representation may record only the regions that diverged from an earlier image. This tool closes that loop by taking such a diff-shaped sparse file and merging its non-hole content into a writable base file at matching offsets, so the base file’s on-disk layout reflects the union of “keep what was already there” for holes and “take the diff bytes” for data regions.
+   1.1. The executable performs one storage-level operation: merge a sparse “diff” snapshot of guest memory bytes into an existing “base” snapshot by copying only those byte ranges where the diff actually holds data. Checkpointing stacks often keep memory images as sparse files so unchanged or logically zero regions do not consume backing blocks; incremental layers may record only divergences from an earlier image. Rebasing applies that layer onto a writable base at matching offsets so the base’s on-disk layout reflects “preserve base bytes wherever the diff has a hole” and “take diff bytes wherever the diff has data.”
 
-   1.2. The operation is in-place on the base side: the base is opened for read-write and mutated; the diff is read-only and serves only as the source of bytes to copy. No new output file is created by the tool itself—the base path is both input and output for the merged result.
+   1.2. The base file is both the merge target and the output: it is opened read-write and updated in place. The diff is read-only. No separate output path exists; operators choose the base path knowing it will be mutated.
 
-   1.3. The user-facing surface is intentionally minimal: exactly two path arguments identify the base and the diff. Help and version modes exist; normal execution always prints a deprecation notice directing operators toward a successor workflow (“snapshot-editor”), signaling that new integrations should not assume long-term availability of this binary even though it remains functional.
+   1.3. Every successful run that actually performs the merge first prints a deprecation notice on standard output, steering new integrations toward the maintained successor workflow bundled with the broader snapshot tooling. Help and version modes also surface the same deprecation text so even informational invocations reinforce migration.
 
-2. **Sparse-file semantics as the driver of control flow**
+2. **Merge algorithm**
 
-   2.1. On Unix systems that support it, a file may contain “holes”: ranges that are logically zero or unallocated from the application’s perspective but need not occupy physical blocks. The tool does not read the diff byte-by-byte across its full length. Instead, it walks the diff using kernel-assisted sparse semantics: advance to the next region that contains real data, then determine where that region ends (the start of the next hole or end-of-file). Only those intervals are copied.
+   2.1. **Initialization.** A single 64-bit merge cursor starts at offset zero in the logical byte stream of the diff. The algorithm never scans the diff linearly from start to end in fixed steps; it only jumps from one data extent to the next.
 
-   2.2. The outer loop structure is therefore driven entirely by the diff’s data/hole map. An empty diff or a diff that consists only of holes results in zero copy operations—the base is left unchanged (aside from any side effects of opening it). A fully dense diff from offset zero to EOF behaves like a sequential copy of the entire file length, modulo the transfer mechanism described later.
+   2.2. **Outer loop: discover the next data extent.** From the current cursor, the implementation queries the kernel for the start offset of the next region that contains stored data (not a hole). If no such region exists, the merge completes successfully: nothing further is copied.
 
-   2.3. This design encodes an important invariant: **holes in the diff mean “do not overwrite the base at these offsets.”** The base retains whatever bytes it already had (including its own sparseness pattern) for those ranges. Conversely, **data regions in the diff always overwrite the corresponding offsets in the base**, regardless of whether the base previously held data or a hole at those positions.
+   2.3. **Bound the current extent.** Once a data region starts at some offset, the end is found by seeking from that start to the beginning of the next hole. If the file has no trailing hole (data runs all the way to logical end-of-file), the end offset is taken as the file length reported by metadata. The work item for this iteration is the half-open interval from region start up to but not including region end.
 
-3. **Merge algorithm**
+   2.4. **Inner loop: drain the extent.** While the merge cursor is still strictly less than region end, the base descriptor is positioned to the same absolute offset as the cursor. A bulk zero-copy transfer moves bytes from the diff descriptor into the base descriptor. The transfer API uses a pointer to a 64-bit offset that the kernel advances on the read side so that repeated calls continue where the previous call stopped; that offset is the same variable as the merge cursor, which keeps diff-side read position and “which base offset we are writing” aligned. If the kernel returns a short count, the inner loop retries until the cursor reaches region end or an error occurs.
 
-   3.1. A running offset cursor starts at the beginning of the logical file. Each iteration locates the next data region in the diff at or after the current cursor by querying “next data” semantics from the current position. If no such region exists, the merge completes successfully.
+   2.5. **Advance to the next extent.** After an extent is fully drained, the outer loop again asks for the next data region at or after the cursor. The cursor always moves forward; there is no backward seek in normal operation.
 
-   3.2. For a located data region, the end boundary is resolved by seeking to the next hole after the region’s start. If the file has no trailing hole (dense to EOF), the end is taken as the diff’s reported length. The half-open interval `[region_start, region_end)` is the contiguous range of bytes to synchronize from diff to base.
+   2.6. **Termination and empty inputs.** Empty diff and empty base both yield a vacuous outer loop (no data regions) or inner loops of zero width. A diff that has been extended to a large logical size but contains only holes produces no copy operations: the base remains byte-for-byte as before (aside from open metadata effects).
 
-   3.3. Within that interval, bytes are transferred in one or more kernel chunks using a zero-copy path: the base descriptor is positioned to the same offset as the logical merge cursor, and a system call moves bytes from the diff descriptor into the base descriptor while atomically advancing a shared offset variable that tracks the current position in both streams for that segment. The count passed to each transfer is the remaining length in the current data region, possibly split across multiple calls if the kernel returns partial progress (the loop continues until the cursor reaches `region_end`).
+   2.7. **Strict failure semantics.** Any failure while opening either file, any seek used for data/hole discovery or for positioning the base, any metadata read needed for the end-of-file edge case, or any negative result from the bulk transfer maps to a typed error printed on standard error and a non-zero exit. There is no resume-from-checkpoint mode and no partial-success flag.
 
-   3.4. Error handling is strict: any failure in seeking (whether for positioning the base, finding data, or finding holes), any failure retrieving file size for the edge case at EOF, or any negative result from the bulk transfer syscall maps to a typed error that surfaces to the user on standard error and yields a non-zero process exit. There is no partial-success mode—an I/O error aborts the whole operation.
+3. **Hole versus zero semantics**
 
-4. **Why alignment of offsets matters**
+   3.1. **Holes mean “leave the base unchanged.”** If a byte range in the diff is a hole, the merge never writes those offsets. Whatever the base already contained—older snapshot bytes, another hole, or a mix—remains. That is how a diff expresses “unchanged from the layer below” without storing redundant bytes.
 
-   4.1. The merge cursor is a single scalar that simultaneously represents “where we are in the diff” for read-side semantics and “where we are writing in the base.” That is only correct if both files describe the **same linear address space** starting at offset zero: snapshot slot *N* in the diff corresponds to snapshot slot *N* in the base. The tool does not remap, pad, or relocate regions; it assumes identical logical lengths and alignment of semantic content.
+   3.2. **Allocated zeros are data.** If a range is stored as real blocks filled with zero bytes, sparse discovery treats that range as data. The merge overwrites the base with those zeros. That is not equivalent to a hole of the same logical length: zeros win over the previous base contents; holes do not.
 
-   4.2. If the diff is shorter than the base, later offsets in the base are never touched—there is no data in the diff beyond its EOF to iterate. If the diff is longer, data regions that extend past the former base length will still be written through the bulk transfer, which extends the base as needed by the kernel write semantics (subject to filesystem behavior). Tests in the crate explicitly cover “diff longer than base” and “base longer than diff” scenarios to lock in this behavior.
+   3.3. **Pipeline and block size.** Whether a run of zeros is punched as a hole or kept as allocated data depends on how the diff was produced and on filesystem behavior (minimum hole size, fallocate patterns, etc.). The tool does not interpret guest memory meaning; it interprets the storage map. Empirical tests in the crate use runs at least as large as typical minimum hole sizes on common Linux configurations so that “hole in diff” cases are actually sparse at the storage layer.
 
-5. **Interaction between holes, explicit zeros, and “unchanged” regions**
+   3.4. **Interaction matrix (conceptual)**
 
-   5.1. A hole is not the same as a block of zero bytes stored as data. If the diff contains an explicit run of zero-valued bytes that occupies real storage, that range counts as **data** for sparse-walking purposes and will overwrite the base. If the same logical zeros were represented as a hole instead, the base would retain prior content for that range. Operators must therefore understand how their snapshot pipeline materializes zeros—this tool does not interpret guest memory semantics; it interprets **storage** semantics.
+   ```
+        diff has     base had      after merge
+        --------     --------      -----------
+        hole         anything      base unchanged there
+        data         data          diff data wins
+        data         hole          hole filled with diff bytes
+        zeros(data)  anything      base gets zeros there
+   ```
 
-   5.2. When the diff has a hole where the base had data, the base’s data remains after the run—this is how “unchanged from the previous layer” is expressed. When the diff has data where the base had a hole, the hole is filled with the copied bytes. When both have data, the diff wins for that range.
+4. **Alignment and offset correspondence**
 
-6. **High-level data movement (conceptual)**
+   4.1. **Single address space.** The merge cursor is one scalar that simultaneously tracks the read position in the diff (via the kernel-updated offset passed into the bulk transfer) and the write position in the base (explicit seek before each chunk). Correctness requires that byte offset *k* in the diff always maps to byte offset *k* in the base. The tool never adds headers, skips padding, or applies sliding windows.
 
-```
-  Diff (sparse)                         Base (read-write)
-  +---+---+---+---+---+                 +---+---+---+---+
-  | D |   | D |   | D |   seek_data /   | ? | ? | ? | ? |
-  +---+---+---+---+---+   seek_hole     +---+---+---+---+
-        |                       |               ^
-        |    sendfile-style     +---------------+
-        |    copy per data run  (same offsets)
-        v
-  Only "D" intervals are read and written; gaps leave base as-is.
-```
+   4.2. **Relative length.** If the diff is shorter than the base, high offsets in the base are never written because the diff has no data regions there. If the diff is longer, data regions past the former base end extend the base file as writes proceed. Tests cover diff longer than base and base longer than diff with interleaved hole and data patterns at aligned block sizes.
 
-   6.1. The diagram compresses many details (multiple disjoint data runs, partial transfers, EOF handling) but captures the essential pipeline: discovery of `D` intervals on the diff side, then targeted writes into the base at matching offsets.
+   4.3. **No cross-region reordering.** Data regions are processed in ascending offset order as returned by sparse seeks; within a region, copying is strictly increasing in offset.
 
-7. **Command-line interface and validation**
+5. **Command-line interface**
 
-   7.1. Parsing is delegated to a shared argument parser used elsewhere in the workspace. Two positional parameters are required; both must be present for normal execution. If either path cannot be opened as intended (writable for the base, readable for the diff), the error is classified as a file-open failure for the corresponding role.
+   5.1. **Argument model.** Parsing uses the same hand-built argument parser as other related operator tools. Two required parameters name the base file and the diff file. Each is passed as a flag-style argument with a long name (base first in help text, diff second); both values must be present for a normal merge.
 
-   7.2. Help output includes the tool version string, a one-line description of copying non-sparse sections from diff onto base, the deprecation banner, and formatted help for the two parameters. Version output similarly includes version and deprecation text. Thus even successful informational invocations reinforce migration away from this binary.
+   5.2. **Help mode.** When the user asks for help, the program prints the tool name and version line, a one-line description of copying non-sparse sections from diff onto base, the deprecation banner, and formatted help listing the two required parameters. No merge runs.
 
-8. **Error taxonomy (behavioral)**
+   5.3. **Version mode.** When the user asks for version, the program prints version and the deprecation banner on standard output and exits without merging.
 
-   8.1. Errors are grouped at two levels: a file-operation layer distinguishes invalid base open, invalid diff open, seek-to-data failures, seek-to-hole failures, generic seek failures, bulk-transfer failures, and metadata read failures. Above that, a top-level type separates argument parsing problems from snapshot open problems and from merge-time failures, so that messaging can remain specific without conflating user mistakes with I/O faults.
+   5.4. **Default run.** After parsing succeeds and neither help nor version was requested, the deprecation line is printed, then both paths are opened (base writable, diff readable), then the merge runs. Silent success means only the deprecation line on standard output unless the environment or shell adds its own noise; errors go to standard error.
 
-9. **Platform assumptions**
+   5.5. **Validation behavior.** Open failures are classified by which role failed (base versus diff) so messaging can distinguish permission or missing-file problems on the writable side from the read-only side.
 
-   9.1. The implementation targets Unix-like environments where sparse seek helpers and the bulk-transfer syscall used are available; the seek helpers are provided through a small utility trait, and the transfer uses the 64-bit offset variant of the classic zero-copy API. Non-Unix platforms are out of scope for this crate as structured.
+6. **Error taxonomy (behavioral)**
 
-10. **Testing strategy (what is guaranteed)**
+   6.1. **File-operation layer.** Distinct variants cover: invalid base open, invalid diff open, failure to seek to the next data extent, failure to seek to the next hole, generic seek failure while positioning the base, failure to read file metadata for length, failure in the bulk transfer syscall.
 
-    10.1. Unit coverage exercises argument binding by forcing bad base path and bad diff path and asserting the correct error class, then a happy path where both open.
+   6.2. **Top-level grouping.** A second level separates argument parsing failures (with a hint to retry help), failures that occur while opening inputs before merge, and failures that occur during the merge loop. Parsing errors include a trailing hint line for discoverability.
 
-    10.2. Merge tests include degenerate cases: both empty; diff sized but all holes (base content must survive); diff dense with data only (base becomes an exact copy of diff bytes). Larger tests vary block sizes (aligned to typical filesystem minimum hole punch sizes) and interleave patterns: data in both; data in base with a hole in diff; data in base with explicit zero block in diff; extending diff beyond base; extending base beyond diff. Expected results are built as byte vectors and compared after the merge with positioned reads, which validates end-to-end offset behavior without relying on internal stepping details.
+7. **Platform assumptions**
 
-11. **Optional build features**
+   7.1. The implementation targets Unix-like systems where sparse seek helpers and the 64-bit-offset bulk transfer API exist. Non-Unix targets are out of scope for this crate as structured.
 
-    11.1. The crate declares an optional tracing feature that pulls in instrumentation hooks from shared workspace crates. When enabled, the binary can participate in broader logging/tracing topologies; when disabled, the dependency surface stays minimal for default builds.
+8. **Testing strategy**
 
-12. **Operational summary**
+   8.1. **Argument binding.** Tests exercise bad base path and bad diff path and assert the corresponding open error class, then a happy path where both open.
 
-    12.1. In operation, the tool is a thin, deterministic sparse merge: **walk diff data regions → overwrite base at identical offsets → stop at EOF on the diff side.** It encodes snapshot-layer semantics at the storage level, fails hard on I/O errors, and remains available only as a deprecated stepping stone toward the maintained replacement workflow.
+   8.2. **Merge coverage.** Tests include empty both sides; diff sized to match base but all holes (base content preserved); diff dense with data only (base becomes an exact copy of diff bytes). Larger tests vary block sizes (aligned to typical filesystem hole behavior) and interleave: data in both; data in base with hole in diff; data in base with an explicit zero block in diff; diff extending past base; base extending past diff. Assertions read back file bytes at offsets and compare to expected vectors so correctness is end-to-end rather than tied to internal stepping.
+
+9. **Optional build features**
+
+   9.1. An optional tracing feature wires in instrumentation from shared utility crates; when disabled, the dependency surface stays minimal for default builds.
+
+10. **Operational summary**
+
+   10.1. **One sentence.** Walk diff data extents in order, copy each extent’s bytes into the base at the same offsets, stop when no further data extents exist, fail hard on any I/O error, and remind operators that the standalone binary is deprecated in favor of the integrated workflow.
+
+11. **End-to-end data movement diagram**
+
+   ```
+        DIFF (sparse, read-only)              BASE (read-write)
+
+        offset:  0    4K   8K   12K         same offset axis
+                 |----|hole|----|data|----|
+                          \___________/
+                          one seek_data/seek_hole pair
+                                   \
+                                    \  bulk copy chunks
+                                     ----------------------> base seeked to
+                                                             same offsets
+
+        Regions skipped by design: every gap where diff is hole.
+   ```
