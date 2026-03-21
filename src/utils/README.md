@@ -197,7 +197,7 @@
 
    4.8.4. A value-taking option whose value is intended to be a literal string beginning with the long-option prefix cannot express that on the left segment under the current rules—the next token would be rejected as a missing value. Such values must be placed after the end-of-options marker in the forwarded tail or carried through a different configuration channel.
 
-   4.8.5. Repeatable value-taking options accumulate in encounter order; interleaving with other options preserves a total order over the collected list that mirrors argv order, which matters when order encodes precedence (for example layered configuration).
+   4.8.5. Repeatable value-taking options accumulate in encounter order; interleaving with other options preserves a total order over the collected list that mirrors the host segment’s token order, which matters when order encodes precedence (for example layered configuration).
 
    4.8.6. Relational checks (co-requisites and mutual exclusions) consider only arguments that successfully bound a user value in the first pass, including boolean flags. Options that never completed parsing—because of unknown names, missing values, or duplicates where disallowed—do not participate in that second pass, so ordering of errors can surface structural problems before relational ones.
 
@@ -225,7 +225,7 @@
 
    5.4. **Resource use and sensitive data**
 
-   5.4.1. Parsing is linear in the number of tokens on the left segment and linear in the length of strings stored; there is no deliberate quadratic behavior, but extremely large argv vectors produced by a hostile parent could still stress memory. Embeddings that accept remote configuration should cap argument count and length outside this crate.
+   5.4.1. Parsing is linear in the number of tokens on the left segment and linear in the length of strings stored; there is no deliberate quadratic behavior, but extremely large argument lists produced by a hostile parent could still stress memory. Embeddings that accept remote configuration should cap argument count and length outside this crate.
 
    5.4.2. Error messages and help text may echo option names and values supplied by the user; logs that include parse errors should be treated as potentially containing secrets (tokens, paths) unless redacted upstream.
 
