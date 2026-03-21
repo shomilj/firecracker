@@ -43,7 +43,7 @@
 
    2.2. Guest physical memory is represented as a collection of mapped regions with optional per-page dirty tracking bitmaps. Regions can be backed anonymously, by a single growable memory file (memfd) for contiguous layouts, by snapshot files during restore, or with huge-page–aware mapping flags when configured. Dirty tracking attaches `KVM_MEM_LOG_DIRTY_PAGES` so migration and incremental snapshot strategies can query dirty logs and reset bitmaps between epochs.
 
-   2.3. Registration walks regions in order, assigning monotonically increasing slot indices until the host limit is reached. Each registration pairs a guest physical base, size, host userspace pointer, and optional dirty-log flag. The monitor keeps the in-process `GuestMemory` view and the KVM slot view synchronized: inserting a region updates both the canonical mapping abstraction and the kernel’s view.
+   2.3. Registration walks regions in order, assigning monotonically increasing slot indices until the host limit is reached. Each registration pairs a guest physical base, size, host userspace pointer, and optional dirty-log flag. The monitor keeps the in-process guest memory abstraction and the KVM slot view synchronized: inserting a region updates both the canonical mapping abstraction and the kernel’s view.
 
    2.4. For snapshots, memory can be dumped wholesale, dumped using KVM’s dirty bitmap to minimize I/O, or described for out-of-band filling. Descriptions can include host virtual addresses and offsets into backing files so an external process knows where to place pages—this meshes with lazy restore approaches where the guest starts before every page is resident.
 
@@ -158,7 +158,7 @@
 
    14.1. CPU templates adjust KVM capabilities and guest CPUID or ID-register views to present coherent, sometimes vendor-specific, feature sets to the guest. Static templates encode known-good profiles; custom templates allow operator-defined filtering and feature bits with serde support.
 
-   14.2. Architecture modules encapsulate differences: x86 builds MP-table or ACPI structures, programs APIC/IOAPIC locations, and handles MSR filtering; Arm programs GICv3 state, sets MPIDR views consistently with KVM, and uses MMIO-mapped UART/RTC where expected by kernels. Shared abstractions (`KvmVcpu`, `ArchVm`) hide `ioctl` details behind typed error paths.
+   14.2. Architecture modules encapsulate differences: x86 builds MP-table or ACPI structures, programs APIC/IOAPIC locations, and handles MSR filtering; Arm programs GICv3 state, sets MPIDR views consistently with KVM, and uses MMIO-mapped UART/RTC where expected by kernels. Shared per-architecture vCPU and VM facades hide raw hypervisor ioctl details behind typed error paths.
 
 15. **Logging, metrics, and observability**
 
